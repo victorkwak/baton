@@ -834,27 +834,20 @@ fn located_expansion(words: &[Option<Loose>], roots: &[&Path], strict: bool) -> 
     // expansions, so the per-word rule below cannot see them), and a bare
     // `export NAME` of a variable that decides where git acts.
     let base = |w: &Loose| w.text.rsplit('/').next().unwrap_or(&w.text).to_owned();
-    let runtime_setter = all.iter().enumerate().any(|(i, w)| {
+    let runtime_setter = all.iter().any(|w| {
         !w.dynamic
-            && (matches!(
+            && matches!(
                 base(w).as_str(),
-                "read" | "mapfile" | "readarray" | "getopts"
-            ) || (base(w) == "printf"
-                && all.get(i + 1).is_some_and(|n| n.text.starts_with("-v"))))
-    });
-    let location_name = |t: &str| {
-        (t.starts_with("GIT_") && !t.contains('='))
-            || matches!(t, "PWD" | "OLDPWD" | "CDPATH" | "HOME" | "XDG_CONFIG_HOME")
-    };
-    let bare_export = all.windows(2).any(|p| {
-        matches!(
-            base(p[0]).as_str(),
-            "export" | "declare" | "typeset" | "readonly" | "local"
-        ) && location_name(&p[1].text)
-    }) || all
-        .iter()
-        .any(|w| location_name(&w.text) && w.text != "HOME" && w.text.starts_with("GIT_"));
-    if runtime_setter || bare_export {
+                "read" | "mapfile" | "readarray" | "getopts" | "select"
+            )
+    }) || (all.iter().any(|w| !w.dynamic && base(w) == "printf")
+        && all.iter().any(|w| w.text.starts_with("-v")));
+    // A variable that decides where git acts, *named* outside an expansion
+    // (`GIT_DIR=…`, `export GIT_DIR`, `declare -n x=GIT_DIR`, `for PWD in
+    // …`, `read CDPATH`): whatever builtin names it may set it. Reading it
+    // (`$PWD`, `${GIT_DIR}`) is an expansion and handled below.
+    let named_location = all.iter().any(|w| location_var_named(&w.text));
+    if runtime_setter || named_location {
         return true;
     }
     const LOC_OPTS: &[&str] = &["-C", "--git-dir", "--work-tree", "--namespace"];
@@ -942,6 +935,28 @@ fn located_expansion(words: &[Option<Loose>], roots: &[&Path], strict: bool) -> 
         }
     }
     false
+}
+
+/// Does `text` name a variable that decides where git acts (`GIT_*`,
+/// `PWD`, `OLDPWD`, `CDPATH`, `XDG_CONFIG_HOME`, `HOME`) other than by
+/// expanding it (`$NAME`, `${NAME…}`)?
+fn location_var_named(text: &str) -> bool {
+    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(GIT_[A-Z0-9_]+|OLDPWD|PWD|CDPATH|XDG_CONFIG_HOME|HOME)\b")
+            .expect("valid regex")
+    });
+    RE.find_iter(text).any(|m| {
+        let before = &text[..m.start()];
+        let prev = before.chars().next_back();
+        // Part of a longer name (`MY_HOME`, `XDG_CONFIG_HOME` matched as HOME),
+        // or an expansion (`$HOME`, `${HOME}`, `${HOME:-x}`).
+        // An attached option (`printf -vGIT_DIR`) still names it; for `GIT_*`
+        // a longer identifier is rare enough that asking is the safe side.
+        let longer = prev.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+            && !before.ends_with("-v")
+            && !m.as_str().starts_with("GIT_");
+        !(longer || before.ends_with('$') || before.ends_with("${"))
+    })
 }
 
 /// Is a dynamic word only `$HOME/…` or `${HOME}/…` with a literal rest?
@@ -1286,6 +1301,35 @@ fn inside(path: &Path, root: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn location_variables_named_but_not_expanded() {
+        for t in [
+            "GIT_DIR=x",
+            "r=GIT_DIR",
+            "GIT_WORK_TREE",
+            "PWD",
+            "CDPATH=/a",
+            "OLDPWD",
+            "XDG_CONFIG_HOME=/x",
+            "HOME=/tmp",
+            "-vGIT_DIR",
+        ] {
+            assert!(location_var_named(t), "{t}");
+        }
+        for t in [
+            "$PWD",
+            "${HOME}",
+            "${HOME:-x}/a",
+            "$GIT_DIR",
+            "MY_HOME=1",
+            "--git-dir=x",
+            "home",
+            "XPWD",
+        ] {
+            assert!(!location_var_named(t), "{t}");
+        }
+    }
 
     fn w(t: &str) -> Option<Vec<String>> {
         simple_words(t)

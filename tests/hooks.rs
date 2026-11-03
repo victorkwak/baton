@@ -1215,6 +1215,8 @@ fn guard_never_silently_allows_known_bypass_shapes() {
     assert_eq!(run("cd src && cargo test"), None);
     // A run-time setter without git near a baton repo stays silent.
     assert_eq!(run("read -r x < f; echo \"$x\""), None);
+    // Reading location variables is not naming them.
+    assert_eq!(run("echo \"$PWD\" ${HOME} $OLDPWD"), None);
     // Expansions are unknown: with git in the text they ask, from anywhere
     // (review 3).
     for cmd in [
@@ -1249,6 +1251,12 @@ fn guard_never_silently_allows_known_bypass_shapes() {
         "read -r GIT_DIR < f; export GIT_DIR; git commit -m x",
         "mapfile -t A < f; GIT_DIR=${A[0]} git commit -m x",
         "export -x GIT_WORK_TREE; git commit -m x",
+        // Location variables named any way (review 7).
+        "declare -n r=GIT_DIR; r=$G; export GIT_DIR; git commit -m x",
+        "for GIT_DIR in $G; do export GIT_DIR; git commit -m x; done",
+        "select CDPATH in $P; do cd notes && git commit -m x; done",
+        "printf -- -v GIT_DIR %s \"$G\"; git commit -m x",
+        "export A=1 GIT_DIR; git commit -m x",
     ] {
         asks_or_denies(ws, cmd, &s.repo);
     }
