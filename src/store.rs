@@ -194,7 +194,7 @@ impl Store {
             main = Some(o.clone());
         }
         let mut commits = match &origin {
-            Some(o) => self.commits(std::slice::from_ref(o))?,
+            Some(o) => self.commits(std::slice::from_ref(o), false)?,
             None => Vec::new(),
         };
         let remote_commits = commits.len();
@@ -205,7 +205,7 @@ impl Store {
             (None, Some(m)) => Some(vec![m.clone()]),
         };
         if let Some(range) = queued_range {
-            commits.extend(self.commits(&range)?);
+            commits.extend(self.commits(&range, true)?);
         }
 
         let mut located = Vec::new();
@@ -263,7 +263,13 @@ impl Store {
     /// Commits of `range` in first-parent order, oldest first, with the
     /// board files each one added (sorted by id). Modified or deleted paths
     /// are ignored: a record is what its file held when it was added.
-    fn commits(&self, range: &[String]) -> Result<Vec<CommitFiles>> {
+    ///
+    /// The stream holds only what git generates (NUL-separated commit ids
+    /// and raw diff entries), never commit messages: a message is written by
+    /// whoever pushed, and parsing it from the same stream would let it
+    /// forge file entries. Messages are read separately, only when
+    /// `with_messages`.
+    fn commits(&self, range: &[String], with_messages: bool) -> Result<Vec<CommitFiles>> {
         let mut args: Vec<String> = [
             "log",
             "--first-parent",
@@ -271,42 +277,34 @@ impl Store {
             "--no-renames",
             "--raw",
             "--no-abbrev",
-            "--format=%x01%H%x02%B%x03",
+            "-z",
+            "--format=%H",
         ]
         .map(String::from)
         .to_vec();
         args.extend(range.iter().cloned());
         args.push("--".into());
         let out = self.git.run(&args)?;
-        let text = out.stdout_str();
-        let mut commits: Vec<CommitFiles> = Vec::new();
-        let mut blobs: Vec<String> = Vec::new();
-        for chunk in text.split('\u{1}').filter(|c| !c.is_empty()) {
-            let (sha, rest) = chunk.split_once('\u{2}').unwrap_or((chunk, ""));
-            let (message, raw) = rest.split_once('\u{3}').unwrap_or((rest, ""));
-            let mut files = Vec::new();
-            for line in raw.lines().filter(|l| l.starts_with(':')) {
-                // :old_mode new_mode old_sha new_sha status\tpath
-                let Some((meta, path)) = line.split_once('\t') else {
-                    continue;
-                };
-                let f: Vec<&str> = meta.split_whitespace().collect();
-                if f.len() == 5 && f[4] == "A" && is_record_path(path) {
-                    files.push((path.to_owned(), f[3].to_owned()));
-                }
+        let mut commits = parse_log_z(&out.stdout)?;
+        if with_messages {
+            for c in &mut commits {
+                c.message = self
+                    .git
+                    .run(["log", "-1", "--format=%B", c.sha.as_str()])?
+                    .stdout_str()
+                    .trim_end()
+                    .to_owned();
             }
-            files.sort_by(|a, b| file_id(&a.0).cmp(file_id(&b.0)));
-            blobs.extend(files.iter().map(|(_, b)| b.clone()));
-            commits.push(CommitFiles {
-                sha: sha.trim().to_owned(),
-                message: message.trim_end().to_owned(),
-                files: files
-                    .into_iter()
-                    .map(|(p, b)| (p, b.into_bytes()))
-                    .collect(),
-            });
         }
         // Replace blob ids by contents, in one cat-file call.
+        let blobs: Vec<String> = commits
+            .iter()
+            .flat_map(|c| {
+                c.files
+                    .iter()
+                    .map(|f| String::from_utf8_lossy(&f.1).into_owned())
+            })
+            .collect();
         if !blobs.is_empty() {
             let input: String = blobs.iter().map(|b| format!("{b}\n")).collect();
             let out = self
@@ -318,7 +316,9 @@ impl Store {
             let mut contents = parse_batch(&out.stdout, blobs.len())?.into_iter();
             for c in &mut commits {
                 for f in &mut c.files {
-                    f.1 = contents.next().expect("one content per blob");
+                    // A missing blob (damaged clone) becomes one rejected
+                    // record instead of failing the whole read.
+                    f.1 = contents.next().flatten().unwrap_or_default();
                 }
             }
         }
@@ -616,14 +616,66 @@ fn file_id(path: &str) -> &str {
     name.split('.').next().unwrap_or(name)
 }
 
-/// Parse `git cat-file --batch` output: `<sha> <type> <size>\n<bytes>\n`.
-fn parse_batch(out: &[u8], n: usize) -> Result<Vec<Vec<u8>>> {
+/// Parse `git log -z --raw --format=%H` output: NUL-separated tokens. A
+/// token that is a full hex object id starts a commit; a token starting
+/// with `:` (after an optional newline) is a raw diff entry
+/// (`:old_mode new_mode old_sha new_sha status`) whose path is the next
+/// token. Only added record paths are kept, with the blob id in place of
+/// the contents (filled in by `commits`).
+fn parse_log_z(out: &[u8]) -> Result<Vec<CommitFiles>> {
+    let err = |what: &str| Error::new(Kind::Internal, format!("unexpected git log output: {what}"));
+    let is_oid =
+        |t: &str| (t.len() == 40 || t.len() == 64) && t.bytes().all(|b| b.is_ascii_hexdigit());
+    let mut commits: Vec<CommitFiles> = Vec::new();
+    let mut tokens = out.split(|&b| b == 0);
+    while let Some(raw) = tokens.next() {
+        let token = std::str::from_utf8(raw).map_err(|_| err("not UTF-8"))?;
+        let token = token.trim_start_matches('\n');
+        if token.is_empty() {
+            continue;
+        }
+        if let Some(meta) = token.strip_prefix(':') {
+            let path = tokens.next().ok_or_else(|| err("entry without a path"))?;
+            let path = std::str::from_utf8(path).map_err(|_| err("path not UTF-8"))?;
+            let commit = commits
+                .last_mut()
+                .ok_or_else(|| err("entry before a commit"))?;
+            let f: Vec<&str> = meta.split(' ').collect();
+            if f.len() == 5 && f[4] == "A" && is_record_path(path) {
+                commit
+                    .files
+                    .push((path.to_owned(), f[3].as_bytes().to_vec()));
+            }
+        } else if is_oid(token) {
+            commits.push(CommitFiles {
+                sha: token.to_owned(),
+                message: String::new(),
+                files: Vec::new(),
+            });
+        } else {
+            return Err(err("unknown token"));
+        }
+    }
+    for c in &mut commits {
+        c.files.sort_by(|a, b| file_id(&a.0).cmp(file_id(&b.0)));
+    }
+    Ok(commits)
+}
+
+/// Parse `git cat-file --batch` output: `<sha> <type> <size>\n<bytes>\n`,
+/// or `<name> missing\n` (`None`).
+fn parse_batch(out: &[u8], n: usize) -> Result<Vec<Option<Vec<u8>>>> {
     let err = || Error::new(Kind::Internal, "unexpected git cat-file --batch output");
     let mut res = Vec::with_capacity(n);
     let mut i = 0;
     while res.len() < n {
         let nl = out[i..].iter().position(|&b| b == b'\n').ok_or_else(err)? + i;
         let header = std::str::from_utf8(&out[i..nl]).map_err(|_| err())?;
+        if header.ends_with(" missing") || header.ends_with(" ambiguous") {
+            res.push(None);
+            i = nl + 1;
+            continue;
+        }
         let size: usize = header
             .split(' ')
             .nth(2)
@@ -634,7 +686,7 @@ fn parse_batch(out: &[u8], n: usize) -> Result<Vec<Vec<u8>>> {
         if end > out.len() {
             return Err(err());
         }
-        res.push(out[start..end].to_vec());
+        res.push(Some(out[start..end].to_vec()));
         i = end + 1;
     }
     Ok(res)
@@ -660,4 +712,78 @@ fn clone(url: &str, path: &Path) -> Result<()> {
         path.as_os_str(),
     ])?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    }
+
+    /// A commit message that imitates a raw diff entry must not add a record:
+    /// messages are not part of the parsed stream.
+    #[test]
+    fn a_commit_message_cannot_forge_file_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        git(dir, &["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(dir.join("messages")).unwrap();
+        std::fs::write(dir.join("messages/01REAL.md"), "real\n").unwrap();
+        git(dir, &["add", "."]);
+        let blob = git(dir, &["rev-parse", ":messages/01REAL.md"]);
+        let forged = format!(
+            "x\n:000000 100644 {z} {blob} A\tmessages/01FAKE.md\n\u{1}\u{2}\u{3}",
+            z = "0".repeat(40)
+        );
+        git(dir, &["commit", "-q", "-m", &forged]);
+        std::fs::write(dir.join("messages/02 SPACE.md"), "two\n").unwrap();
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-q", "-m", "second"]);
+        let out = crate::git::Git::new(dir)
+            .run([
+                "log",
+                "--first-parent",
+                "--reverse",
+                "--no-renames",
+                "--raw",
+                "--no-abbrev",
+                "-z",
+                "--format=%H",
+                "--",
+            ])
+            .unwrap();
+        let commits = parse_log_z(&out.stdout).unwrap();
+        assert_eq!(commits.len(), 2);
+        let paths: Vec<&str> = commits
+            .iter()
+            .flat_map(|c| c.files.iter().map(|f| f.0.as_str()))
+            .collect();
+        assert_eq!(paths, ["messages/01REAL.md", "messages/02 SPACE.md"]);
+    }
+
+    #[test]
+    fn a_missing_blob_is_one_none_not_a_failure() {
+        let out = b"abc missing\n0123 blob 3\nxyz\n";
+        let res = parse_batch(out, 2).unwrap();
+        assert_eq!(res, vec![None, Some(b"xyz".to_vec())]);
+    }
 }
