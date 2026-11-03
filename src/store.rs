@@ -558,11 +558,23 @@ impl Store {
                     let jitter = random_u64() % (2u64 << attempt);
                     std::thread::sleep(Duration::from_millis(jitter));
                 }
-                Err(e) if matches!(e.kind, Kind::Offline | Kind::Auth) => {
-                    let rule_bearing = records.iter().any(Record::rule_bearing);
-                    return self.queue_offline(&records, rule_bearing, summary, "push", e);
+                Err(e) => {
+                    // The result may be unclear (a timeout, a dropped
+                    // connection after the remote took the commit): look
+                    // before reporting a failure.
+                    if self.landed(&sha) {
+                        self.git.run(["update-ref", MAIN, &sha])?;
+                        return Ok(Written {
+                            commit: sha,
+                            queued: false,
+                        });
+                    }
+                    if matches!(e.kind, Kind::Offline | Kind::Auth) {
+                        let rule_bearing = records.iter().any(Record::rule_bearing);
+                        return self.queue_offline(&records, rule_bearing, summary, "push", e);
+                    }
+                    return Err(e);
                 }
-                Err(e) => return Err(e),
             }
         }
         crate::fail!(
@@ -570,6 +582,16 @@ impl Store {
             "remote: the push lost the race {} times; nothing was written (try again)",
             RETRIES + 1
         )
+    }
+
+    /// After a failed push: fetch, and is `sha` on the remote's `main`?
+    fn landed(&self, sha: &str) -> bool {
+        self.fetch().is_ok()
+            && self
+                .origin_tip()
+                .ok()
+                .flatten()
+                .is_some_and(|o| self.is_ancestor(sha, &o).unwrap_or(false))
     }
 
     /// The remote is unreachable (`cause`: offline or auth): commit plain

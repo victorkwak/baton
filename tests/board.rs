@@ -1016,3 +1016,28 @@ fn a_push_refused_for_permissions_is_auth_and_the_queue_is_delivered_by_inbox() 
     assert_eq!(r.stderr, "", "{r:?}");
     assert_eq!(net.history().len(), before + 1);
 }
+
+#[test]
+fn a_push_whose_result_is_unclear_is_checked_before_reporting() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let (net, mut ws, laptop) = pair();
+    ws.run(&["inbox"]).ok();
+    let before = net.history().len();
+    // The remote takes the commit, then holds the connection open past
+    // baton's git timeout: the push times out although it landed.
+    let hook = net.bare.join("hooks/post-receive");
+    std::fs::write(&hook, "#!/bin/sh\nsleep 4\n").unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    ws.env.push(("BATON_GIT_TIMEOUT_SECS".into(), "1".into()));
+    let r = ws.run(&["post", "--to", "laptop", "-m", "x", "slow remote"]);
+    assert_eq!(r.code, 0, "{r:?}");
+    let id = r.stdout.trim().to_owned();
+    assert!(!r.stderr.contains("queued"), "{r:?}");
+    assert_eq!(net.history().len(), before + 1);
+    std::fs::remove_file(&hook).unwrap();
+    assert_eq!(laptop.inbox_ids(false), vec![id]);
+    // Nothing is left queued to push twice.
+    ws.env.clear();
+    ws.post("laptop", "next", &[]);
+    assert_eq!(net.history().len(), before + 2);
+}

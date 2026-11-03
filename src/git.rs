@@ -16,6 +16,15 @@ use crate::error::{Error, Kind, Result};
 /// Default limit for one git call.
 pub const TIMEOUT: Duration = Duration::from_secs(60);
 
+/// [`TIMEOUT`], or `BATON_GIT_TIMEOUT_SECS` (tests).
+fn default_timeout() -> Duration {
+    std::env::var("BATON_GIT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .map_or(TIMEOUT, Duration::from_secs)
+}
+
 /// A git invocation in one repository.
 #[derive(Debug, Clone)]
 pub struct Git {
@@ -133,7 +142,7 @@ impl Git {
         Self {
             dir: dir.into(),
             env: Vec::new(),
-            timeout: TIMEOUT,
+            timeout: default_timeout(),
         }
     }
 
