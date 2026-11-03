@@ -56,18 +56,54 @@ impl Output {
 /// characters (`%C`) must stay under the ~104-byte Unix socket limit.
 const MAX_CONTROL_DIR: usize = 56;
 
-/// The `GIT_SSH_COMMAND` every call uses. Connection reuse only with a
-/// private directory: with `ControlMaster=auto`, ssh uses any socket already
-/// at the path, so a directory another user can write to (like `/tmp`)
-/// would let them sit in the middle of the connection.
-pub fn ssh_command() -> String {
-    const BASE: &str = "ssh -o BatchMode=yes -o ConnectTimeout=10";
-    match control_dir() {
-        Some(dir) => format!(
-            "{BASE} -o ControlMaster=auto -o ControlPersist=60 -o 'ControlPath={}/bcm-%C'",
-            dir.display()
+/// The `GIT_SSH_COMMAND` every call in `dir` uses: the SSH command git would
+/// use there (so a repo's `core.sshCommand` key choice still applies), plus
+/// baton's options. ssh keeps the first value of each option, so the user's
+/// own options win.
+///
+/// Connection reuse only with a private directory: with
+/// `ControlMaster=auto`, ssh uses any socket already at the path, so a
+/// directory another user can write to (like `/tmp`) would let them sit in
+/// the middle of the connection.
+pub fn ssh_command(dir: &Path) -> String {
+    let base = configured_ssh(dir);
+    let reuse = match control_dir() {
+        Some(cdir) => format!(
+            "-o ControlMaster=auto -o ControlPersist=60 -o 'ControlPath={}/bcm-%C'",
+            cdir.display()
         ),
-        None => format!("{BASE} -o ControlMaster=no"),
+        None => "-o ControlMaster=no".to_owned(),
+    };
+    format!("{base} -o BatchMode=yes -o ConnectTimeout=10 {reuse}")
+}
+
+/// The SSH command git itself would run for `dir`: `$GIT_SSH_COMMAND`, else
+/// `core.sshCommand` (repo, global or system config), else `$GIT_SSH`, else
+/// `ssh`.
+fn configured_ssh(dir: &Path) -> String {
+    let nonempty = |s: String| (!s.trim().is_empty()).then_some(s);
+    if let Some(cmd) = std::env::var("GIT_SSH_COMMAND").ok().and_then(nonempty) {
+        return cmd;
+    }
+    let mut git = Command::new("git");
+    if dir.is_dir() {
+        git.arg("-C").arg(dir);
+    }
+    let configured = git
+        .args(["config", "--get", "core.sshCommand"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| nonempty(String::from_utf8_lossy(&o.stdout).trim().to_owned()));
+    if let Some(cmd) = configured {
+        return cmd;
+    }
+    // GIT_SSH names a program without arguments.
+    match std::env::var("GIT_SSH").ok().and_then(nonempty) {
+        Some(prog) if !prog.contains('\'') => format!("'{prog}'"),
+        _ => "ssh".to_owned(),
     }
 }
 
@@ -135,7 +171,7 @@ impl Git {
         cmd.arg("-C")
             .arg(&self.dir)
             .args(args)
-            .env("GIT_SSH_COMMAND", ssh_command())
+            .env("GIT_SSH_COMMAND", ssh_command(&self.dir))
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("LC_ALL", "C")
             .stdin(if input.is_some() {
@@ -285,8 +321,42 @@ mod tests {
     }
 
     #[test]
+    fn keeps_the_repos_own_ssh_command_first() {
+        // A repo that pins its key (like `core.sshCommand "ssh -i key"`)
+        // must keep it: baton's options are appended, never replacing it.
+        if std::env::var_os("GIT_SSH_COMMAND").is_some() {
+            return; // the environment would win, as it does for git itself
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let git = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(dir)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            )
+        };
+        git(&["init", "-q"]);
+        git(&[
+            "config",
+            "core.sshCommand",
+            "ssh -i /path/to/repo_key -o IdentitiesOnly=yes",
+        ]);
+        let cmd = ssh_command(dir);
+        assert!(
+            cmd.starts_with("ssh -i /path/to/repo_key -o IdentitiesOnly=yes "),
+            "{cmd}"
+        );
+        assert!(cmd.contains("BatchMode=yes"), "{cmd}");
+    }
+
+    #[test]
     fn control_path_is_short_and_private_or_off() {
-        let cmd = ssh_command();
+        let cmd = ssh_command(Path::new("/nonexistent-dir"));
         assert!(cmd.contains("BatchMode=yes"), "{cmd}");
         match cmd.split("ControlPath=").nth(1) {
             Some(rest) => {
