@@ -24,6 +24,7 @@ baton post --to mac --task t --plan "Subject" -m "…"
 baton take <id> / baton close <id> [--wontdo] -m "…"
 baton wait --task t                 # block until the other machine answers
 baton tasks                         # what is in flight, who leads, what is stale
+baton off / baton on                # stop / resume waking this session
 baton sync --paths <files>          # commit and share notes safely
 ```
 

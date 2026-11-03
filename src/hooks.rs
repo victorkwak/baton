@@ -89,6 +89,10 @@ pub struct Arming {
     /// message outside any task expires after [`ARMING_TTL_SECS`].
     #[serde(default)]
     pub armed_at: BTreeMap<String, i64>,
+    /// `baton off`: never wake this session, until `baton on`. Arming
+    /// still records tasks and messages, so `on` resumes them.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub off: bool,
 }
 
 /// How long arming lasts without a task to end it, and how old a session
@@ -115,6 +119,7 @@ impl Arming {
             let e = self.armed_at.entry(k.clone()).or_insert(*v);
             *e = (*e).max(*v);
         }
+        self.off |= other.off;
     }
 
     fn path(key: &str) -> Result<PathBuf> {
@@ -280,6 +285,37 @@ pub fn arm(store: &Store, ids: &[&str]) -> Result<()> {
     }
     prune_sessions(&dir);
     Ok(())
+}
+
+/// Turn waking off (or back on) for this agent session, under every key
+/// its environment names and every key it was armed under. Returns those
+/// keys; empty outside Claude Code or without a session key.
+pub fn set_off(off: bool) -> Result<Vec<String>> {
+    let mut keys = env_keys();
+    if !crate::identity::is_agent() || keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let dir = sessions_dir()?;
+    std::fs::create_dir_all(&dir)?;
+    let lock = File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join("arming.lock"))?;
+    lock.lock()?;
+    for k in Arming::load_all(&keys)?.keys {
+        if valid_key(&k) && !keys.contains(&k) {
+            keys.push(k);
+        }
+    }
+    for key in &keys {
+        let mut a = Arming::load(key)?;
+        a.off = off;
+        a.keys.extend(keys.iter().cloned());
+        let text = serde_json::to_vec_pretty(&a).map_err(anyhow::Error::from)?;
+        write_atomic(&Arming::path(key)?, &text)?;
+    }
+    Ok(keys)
 }
 
 /// Remove session files (arming, waiter state, generation) not written

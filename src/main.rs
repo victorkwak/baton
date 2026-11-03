@@ -46,6 +46,10 @@ enum Command {
     Sync(notes::SyncArgs),
     /// One pass of the idle notes sweeper.
     Sweep,
+    /// Stop waking this Claude Code session (until `baton on`).
+    Off,
+    /// Resume waking this Claude Code session.
+    On,
     /// Claude Code hooks.
     #[command(subcommand)]
     Hook(hooks::HookCommand),
@@ -70,6 +74,8 @@ fn main() -> ExitCode {
         Command::Human(c) => board::human(f, c),
         Command::Sync(a) => notes::sync(f, a),
         Command::Sweep => notes::sweep(f),
+        Command::Off => hooks::set_waking(f, false),
+        Command::On => hooks::set_waking(f, true),
         Command::Hook(c) => hooks::hook(c),
         Command::Init(a) => setup::init(a),
         Command::Doctor => setup::doctor(f),

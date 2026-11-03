@@ -36,6 +36,41 @@ pub fn hook(cmd: HookCommand) -> Result<()> {
     }
 }
 
+/// `baton off` / `baton on`: stop or resume waking this session. `off`
+/// also ends its running waiter (a newer generation) within a second.
+pub fn set_waking(format: crate::Format, on: bool) -> Result<()> {
+    let keys = crate::hooks::set_off(!on)?;
+    let Some(primary) = keys.first() else {
+        crate::fail!(
+            Internal,
+            "`baton {}` is for an agent session inside Claude Code",
+            if on { "on" } else { "off" }
+        );
+    };
+    if !on {
+        let dir = sessions_dir()?;
+        for k in &keys {
+            Generation::new().write(&dir, k)?;
+        }
+    }
+    match format {
+        crate::Format::Json => crate::out!(
+            "{}",
+            crate::output::envelope(
+                if on { "on" } else { "off" },
+                serde_json::json!([{"session": primary, "waking": on}])
+            )
+        ),
+        crate::Format::Text if on => crate::out!(
+            "baton: waking is on for this session; replies in its tasks wake it again after this turn"
+        ),
+        crate::Format::Text => crate::out!(
+            "baton: waking is off for this session; posts still work. `baton on` turns it back on"
+        ),
+    }
+    Ok(())
+}
+
 /// The fields of the waiter's stdin JSON that `baton` reads.
 #[derive(Debug, Default, Deserialize)]
 struct HookInput {
@@ -271,7 +306,7 @@ fn wait() -> Result<()> {
         return Ok(());
     }
     let armed = Arming::load_all(&keys)?;
-    if armed.is_empty() {
+    if armed.is_empty() || armed.off {
         return Ok(());
     }
     // Keys the session was also armed under (e.g. its id before a restart).
@@ -306,6 +341,9 @@ fn wait() -> Result<()> {
 
     loop {
         let arming = Arming::load_all(&keys)?;
+        if arming.off {
+            return Ok(());
+        }
         let snap = {
             let _l = store.lock()?;
             if fetch {

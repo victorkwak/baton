@@ -1564,3 +1564,59 @@ fn guard_asks_for_post_bodies_from_files_or_commands() {
         assert!(r.unwrap().1.contains("post body"), "{cmd}");
     }
 }
+
+#[test]
+fn off_silences_a_session_and_ends_its_waiter_until_on() {
+    let (_net, ws, laptop) = pair();
+    let plan = as_session(
+        &ws,
+        &[
+            "post", "--to", "laptop", "--task", "t1", "--plan", "-m", "p", "Plan",
+        ],
+        Some("host-1"),
+        "ws-s1",
+    );
+    let mut waiter = spawn_waiter(&ws, "ws-s1", Some("host-1"), &[]);
+    still_running(&mut waiter, Duration::from_millis(1500));
+
+    // `off` ends the running waiter at once, without a wake.
+    let out = as_session(&ws, &["off"], Some("host-1"), "ws-s1");
+    assert!(out.contains("waking is off"), "{out}");
+    let run = finish(waiter, Duration::from_secs(5));
+    assert_eq!(run.code, 0, "{run:?}");
+
+    // While off: a reply does not wake, and posting does not turn it on.
+    laptop.post("ws", "r1", &["--task", "t1", "--reply-to", &plan]);
+    as_session(
+        &ws,
+        &["post", "--to", "laptop", "--task", "t1", "-m", "x", "note"],
+        Some("host-1"),
+        "ws-s1",
+    );
+    let run = finish(
+        spawn_waiter(&ws, "ws-s1", Some("host-1"), &[]),
+        Duration::from_secs(5),
+    );
+    assert_eq!(run.code, 0, "{run:?}");
+
+    // A restarted CLI (same host id, new session id) is off too.
+    let run = finish(
+        spawn_waiter(&ws, "ws-s2", Some("host-1"), &[]),
+        Duration::from_secs(5),
+    );
+    assert_eq!(run.code, 0, "{run:?}");
+
+    // `on`: the next waiter wakes for what arrived meanwhile.
+    let out = as_session(&ws, &["on"], Some("host-1"), "ws-s1");
+    assert!(out.contains("waking is on"), "{out}");
+    let run = finish(
+        spawn_waiter(&ws, "ws-s1", Some("host-1"), &[]),
+        Duration::from_secs(20),
+    );
+    assert_eq!(run.code, 2, "{run:?}");
+
+    // Outside a Claude Code session: refused.
+    let mut plain = ws.clone();
+    plain.agent = false;
+    plain.run(&["off"]).code(1);
+}
