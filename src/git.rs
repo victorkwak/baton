@@ -239,8 +239,15 @@ impl Git {
             }
             let _ = child.kill();
             let _ = child.wait();
+            // Only a call that talks to a remote can time out on the
+            // network; a slow local call is an internal problem.
+            let kind = if talks_to_remote(&cmd) {
+                Kind::Remote
+            } else {
+                Kind::Internal
+            };
             return Err(Error::new(
-                Kind::Remote,
+                kind,
                 format!(
                     "git timed out after {}s in {}",
                     self.timeout.as_secs(),
@@ -276,6 +283,33 @@ impl Git {
             .join(" ");
         Err(classify(&what, &out.stderr))
     }
+}
+
+/// Git subcommands that reach a remote.
+const REMOTE_SUBCOMMANDS: &[&str] = &[
+    "fetch",
+    "push",
+    "pull",
+    "ls-remote",
+    "clone",
+    "remote",
+    "archive",
+];
+
+/// Does this git command line reach a remote? Its subcommand is the first
+/// argument after `-C <dir>`, `-c <k=v>` and other options.
+fn talks_to_remote(cmd: &Command) -> bool {
+    let mut args = cmd.get_args().map(|a| a.to_string_lossy());
+    while let Some(a) = args.next() {
+        match a.as_ref() {
+            "-C" | "-c" => {
+                args.next();
+            }
+            a if a.starts_with('-') => {}
+            sub => return REMOTE_SUBCOMMANDS.contains(&sub),
+        }
+    }
+    false
 }
 
 /// Turn a failed git call's stderr into a typed error.
@@ -364,6 +398,23 @@ mod tests {
             Kind::Remote
         );
         assert_eq!(classify("log", "fatal: bad revision").kind, Kind::Internal);
+    }
+
+    #[test]
+    fn a_timeout_is_remote_only_for_calls_that_reach_a_remote() {
+        let tmp = tempfile::tempdir().unwrap();
+        let git = Git::new(tmp.path()).with_timeout(Duration::from_millis(500));
+        assert!(git.output(["init", "-q"]).unwrap().ok());
+        // A slow local call (an alias running a shell command).
+        let e = git
+            .output(["-c", "alias.slow=!sleep 3", "slow"])
+            .unwrap_err();
+        assert_eq!(e.kind, Kind::Internal, "{e}");
+        // A fetch from a remote that never answers.
+        let e = git
+            .output(["-c", "protocol.ext.allow=always", "fetch", "ext::sleep 3"])
+            .unwrap_err();
+        assert_eq!(e.kind, Kind::Remote, "{e}");
     }
 
     #[test]

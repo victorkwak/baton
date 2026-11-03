@@ -1379,3 +1379,60 @@ fn a_waiter_whose_claude_code_is_gone_exits_without_waking() {
     assert_eq!(run.code, 2, "{run:?}");
     assert_eq!(woken_ids(&run.stderr), vec![msg]);
 }
+
+#[test]
+fn arming_for_a_message_without_a_task_ends_and_old_files_are_pruned() {
+    let (_net, ws, laptop) = pair();
+    let q = as_session(
+        &ws,
+        &["post", "--to", "laptop", "-m", "?", "question"],
+        None,
+        "s",
+    );
+    let mut w = spawn_waiter(&ws, "s", None, &[]);
+    still_running(&mut w, Duration::from_millis(1500));
+    // The question is closed: nothing is left to wait for.
+    laptop.run(&["close", &q]).ok();
+    let run = finish(w, Duration::from_secs(15));
+    assert_eq!(run.code, 0, "{run:?}");
+    assert_eq!(run.stderr, "");
+
+    // A question armed more than 7 days ago no longer holds a waiter.
+    let q2 = as_session(
+        &ws,
+        &["post", "--to", "laptop", "-m", "?", "old question"],
+        None,
+        "s2",
+    );
+    let sessions = ws.root.join("state/sessions");
+    let path = sessions.join("s2.json");
+    let mut arming: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let old = jiff_like_now() - 8 * 24 * 3600;
+    arming["armed_at"][&q2] = json!(old);
+    std::fs::write(&path, arming.to_string()).unwrap();
+    let run = finish(spawn_waiter(&ws, "s2", None, &[]), Duration::from_secs(10));
+    assert_eq!(run.code, 0, "{run:?}");
+
+    // Session files not written for 7 days are pruned by the next arming.
+    let stale = sessions.join("gone.json");
+    std::fs::write(&stale, "{}").unwrap();
+    let f = std::fs::File::options().write(true).open(&stale).unwrap();
+    f.set_modified(std::time::SystemTime::now() - Duration::from_secs(8 * 24 * 3600))
+        .unwrap();
+    drop(f);
+    as_session(
+        &ws,
+        &["post", "--to", "laptop", "-m", "x", "another"],
+        None,
+        "s3",
+    );
+    assert!(!stale.exists());
+    assert!(sessions.join("s3.json").exists());
+}
+
+fn jiff_like_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}

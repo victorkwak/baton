@@ -433,11 +433,11 @@ fn all_is_refused_for_agents() {
     let ws = w.machine("ws", false);
     ws.write("a.md", "a\n");
     let out = ws.agent(&["sync", "--all"]);
-    assert_eq!(code(&out), 1);
+    assert_eq!(code(&out), 10);
     assert!(stderr(&out).contains("--paths"), "{}", stderr(&out));
     assert!(ws.status().contains(&"?? a.md".to_owned()));
     let out = ws.agent(&["sweep"]);
-    assert_eq!(code(&out), 1);
+    assert_eq!(code(&out), 10);
 
     // The human (or a script) may.
     ws.write("b.md", "b\n");

@@ -44,8 +44,8 @@ fn check_of(config: &Config) -> Vec<String> {
 pub fn sync(format: Format, args: SyncArgs) -> Result<()> {
     if args.all && is_agent() {
         crate::fail!(
-            Internal,
-            "sync --all is for the human and the sweeper; an agent passes --paths with the files it changed"
+            Rule,
+            "rule human-only: sync --all is for the human and the sweeper; an agent passes --paths with the files it changed"
         );
     }
     let (config, path) = notes_config()?;
@@ -84,8 +84,8 @@ pub fn sync(format: Format, args: SyncArgs) -> Result<()> {
 pub fn sweep(format: Format) -> Result<()> {
     if is_agent() {
         crate::fail!(
-            Internal,
-            "sweep is for the timer and the human; an agent runs baton sync --paths"
+            Rule,
+            "rule human-only: sweep is for the timer and the human; an agent runs baton sync --paths"
         );
     }
     let config = Config::load()?;

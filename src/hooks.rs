@@ -85,7 +85,15 @@ pub struct Arming {
     /// one of them finds the waiter state saved under the others).
     #[serde(default)]
     pub keys: std::collections::BTreeSet<String>,
+    /// Message id → unix seconds of its latest arming. Arming for a
+    /// message outside any task expires after [`ARMING_TTL_SECS`].
+    #[serde(default)]
+    pub armed_at: BTreeMap<String, i64>,
 }
+
+/// How long arming lasts without a task to end it, and how old a session
+/// file may get before it is pruned: 7 days.
+pub const ARMING_TTL_SECS: i64 = 7 * 24 * 3600;
 
 impl Arming {
     pub fn is_empty(&self) -> bool {
@@ -103,6 +111,10 @@ impl Arming {
             *e = (*e).min(*v);
         }
         self.keys.extend(other.keys.iter().cloned());
+        for (k, v) in &other.armed_at {
+            let e = self.armed_at.entry(k.clone()).or_insert(*v);
+            *e = (*e).max(*v);
+        }
     }
 
     fn path(key: &str) -> Result<PathBuf> {
@@ -207,12 +219,14 @@ pub fn arm(store: &Store, ids: &[&str]) -> Result<()> {
     }
     let snap = store.read()?;
     let pos = snap.remote_len;
+    let now = jiff::Timestamp::now().as_second();
     let mut add = Arming::default();
     for id in ids {
         let Some(m) = snap.state.message(id) else {
             continue;
         };
         add.messages.insert(m.msg.id.clone(), pos);
+        add.armed_at.insert(m.msg.id.clone(), now);
         if !m.msg.task.is_empty() && snap.state.task(&m.msg.task).is_none_or(|t| !t.closed) {
             add.tasks.insert(m.msg.task.clone(), pos);
         }
@@ -238,7 +252,38 @@ pub fn arm(store: &Store, ids: &[&str]) -> Result<()> {
         let text = serde_json::to_vec_pretty(&a).map_err(anyhow::Error::from)?;
         write_atomic(&Arming::path(key)?, &text)?;
     }
+    prune_sessions(&dir);
     Ok(())
+}
+
+/// Remove session files (arming, waiter state, generation) not written
+/// for [`ARMING_TTL_SECS`], and such old lock files that nobody holds.
+/// Best effort.
+pub fn prune_sessions(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let ttl = std::time::Duration::from_secs(ARMING_TTL_SECS as u64);
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let old = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > ttl);
+        if !old || name == "arming.lock" {
+            continue;
+        }
+        if name.ends_with(".json") {
+            let _ = std::fs::remove_file(e.path());
+        } else if name.ends_with(".lock")
+            && let Ok(f) = File::options().write(true).open(e.path())
+            && f.try_lock().is_ok()
+        {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
 }
 
 /// [`arm`], warning on stderr instead of failing: the board write already

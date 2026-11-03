@@ -1041,3 +1041,31 @@ fn a_push_whose_result_is_unclear_is_checked_before_reporting() {
     ws.post("laptop", "next", &[]);
     assert_eq!(net.history().len(), before + 2);
 }
+
+#[test]
+fn a_message_to_any_taken_by_the_human_is_the_humans() {
+    if std::process::Command::new("script")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipped: no `script` to provide a TTY");
+        return;
+    }
+    let (_net, ws, laptop) = pair();
+    let id = laptop.post("any", "anyone", &[]);
+    let mut human = ws.clone();
+    human.agent = false;
+    let (code, out) = on_tty(&human, &[], &format!("take {id}")).unwrap();
+    assert_eq!(code, 0, "{out}");
+    // Claimed by the human: an agent cannot change it, nor claim it.
+    let err = ws.run(&["close", &id]).code(10);
+    assert!(err.contains("rule claim"), "{err}");
+    ws.run(&["take", &id]).code(10);
+    let v = ws.run(&["--format", "json", "show", &id]).json();
+    assert_eq!(v["items"][0]["addressee"], HUMAN);
+    // The human releases it; then an agent may claim it.
+    let (code, out) = on_tty(&human, &[], &format!("release {id}")).unwrap();
+    assert_eq!(code, 0, "{out}");
+    ws.run(&["take", &id]).ok();
+}

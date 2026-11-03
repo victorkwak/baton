@@ -19,8 +19,9 @@ use crate::config::Config;
 use crate::error::Result;
 use crate::git::Git;
 use crate::hooks::{
-    Arming, GIT_BUILTINS, GitCall, Invocation, Loc, NOTES_READ_ONLY, Parent, Spec, hook_keys,
-    invocations, locate, parse_push, path_under, sessions_dir, unsafe_read_arg, write_atomic,
+    ARMING_TTL_SECS, Arming, GIT_BUILTINS, GitCall, Invocation, Loc, NOTES_READ_ONLY, Parent, Spec,
+    hook_keys, invocations, locate, parse_push, path_under, sessions_dir, unsafe_read_arg,
+    write_atomic,
 };
 use crate::output::field;
 use crate::record::{MsgKind, random_u64};
@@ -211,15 +212,24 @@ fn wake_key(m: &MsgState) -> String {
     }
 }
 
-/// Anything left to wait for: an armed task still open, or an armed
-/// message outside a closed task.
-fn live(arming: &Arming, state: &State) -> bool {
-    let open = |task: &str| task.is_empty() || state.task(task).is_none_or(|t| !t.closed);
+/// Anything left to wait for: an armed task still open, an armed message
+/// in an open task, or an armed message outside any task that is not
+/// closed and was armed less than [`ARMING_TTL_SECS`] ago.
+fn live(arming: &Arming, state: &State, now: i64) -> bool {
+    let open = |task: &str| state.task(task).is_none_or(|t| !t.closed);
     arming.tasks.keys().any(|t| open(t))
-        || arming
-            .messages
-            .keys()
-            .any(|id| state.message(id).is_none_or(|m| open(&m.msg.task)))
+        || arming.messages.keys().any(|id| match state.message(id) {
+            // Not fetched yet.
+            None => true,
+            Some(m) if !m.msg.task.is_empty() => open(&m.msg.task),
+            Some(m) => {
+                !m.status.is_closed()
+                    && arming
+                        .armed_at
+                        .get(id)
+                        .is_none_or(|t| now - t < ARMING_TTL_SECS)
+            }
+        })
 }
 
 fn unix_now() -> i64 {
@@ -247,6 +257,7 @@ fn wait() -> Result<()> {
     };
     let dir = sessions_dir()?;
     std::fs::create_dir_all(&dir)?;
+    crate::hooks::prune_sessions(&dir);
     // This `Stop` is the newest: announce it, so an older waiter of the
     // session exits, then take the session's lock from it.
     let generation = Generation::new();
@@ -339,9 +350,6 @@ fn wait() -> Result<()> {
                 continue;
             }
         };
-        if !live(&arming, &snap.state) {
-            return Ok(());
-        }
         let cursor = ws.cursor.unwrap_or_else(|| {
             arming
                 .tasks
@@ -363,6 +371,11 @@ fn wait() -> Result<()> {
             return Ok(());
         }
         let now = unix_now();
+        // Wake for what arrived first; then stop when nothing is left to
+        // wait for (a reply and the close of its message can come together).
+        if found.is_empty() && !live(&arming, &snap.state, now) {
+            return Ok(());
+        }
         let mut retry_in: Option<Duration> = None;
         if found.is_empty() {
             if ws.cursor != Some(snap.remote_len) {

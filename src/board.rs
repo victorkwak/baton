@@ -468,6 +468,11 @@ impl State {
                     if ms.msg.to == "any" {
                         match e.status {
                             Status::Open => ms.claimed_by = None,
+                            // The human claims by taking it (`working`);
+                            // its overrides (close, release) claim nothing.
+                            Status::Working if ms.claimed_by.is_none() => {
+                                ms.claimed_by = Some(e.by.clone())
+                            }
                             _ if ms.claimed_by.is_none() && !human => {
                                 ms.claimed_by = Some(e.by.clone())
                             }
