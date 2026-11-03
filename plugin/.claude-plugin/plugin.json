@@ -1,0 +1,19 @@
+{
+  "name": "baton",
+  "displayName": "baton",
+  "version": "0.1.0",
+  "description": "Pick up and hand off work between Claude Code agents on several machines through a git message board. The baton skill (/baton [id]) shows what waits for this machine and takes it only after your go-ahead; it also covers posting plans and handovers, replying and closing. No hooks here: `baton init` prints the Stop and PreToolUse hooks to add. Needs the baton CLI on PATH.",
+  "author": {
+    "name": "Victor Kwak"
+  },
+  "license": "Apache-2.0",
+  "keywords": [
+    "agents",
+    "coordination",
+    "handoff",
+    "git",
+    "multi-machine"
+  ],
+  "homepage": "https://github.com/victorkwak/baton",
+  "repository": "https://github.com/victorkwak/baton"
+}

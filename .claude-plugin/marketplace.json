@@ -1,0 +1,14 @@
+{
+  "name": "baton",
+  "description": "baton: hand work between Claude Code agents on several machines.",
+  "owner": {
+    "name": "Victor Kwak"
+  },
+  "plugins": [
+    {
+      "name": "baton",
+      "source": "./plugin",
+      "description": "The /baton skill: pick up board messages for this machine, post plans and handovers."
+    }
+  ]
+}
