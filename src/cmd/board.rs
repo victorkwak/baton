@@ -399,6 +399,7 @@ fn post_as(format: Format, args: PostArgs, allow_secret: bool) -> Result<()> {
         k => format!("{} {} (task {})", k.as_str(), msg.id, msg.task),
     };
     let w = c.store.push_cas(&summary, |_| Ok(vec![rec.clone()]))?;
+    crate::hooks::arm_or_warn(&c.store, &[&msg.id, &msg.reply_to]);
     print_written(format, "post", &msg.id, &w);
     Ok(())
 }
@@ -420,6 +421,9 @@ fn set_status(format: Format, c: &Ctx, command: &str, id: &str, status: Status) 
     let w = c
         .store
         .push_cas(&format!("{command} {id}"), |_| Ok(vec![ev.clone()]))?;
+    if status == Status::Working {
+        crate::hooks::arm_or_warn(&c.store, &[&id]);
+    }
     print_written(format, command, &id, &w);
     Ok(())
 }
@@ -486,6 +490,7 @@ fn close_with(format: Format, c: &Ctx, args: CloseArgs) -> Result<()> {
             }
             Ok(recs)
         })?;
+    crate::hooks::arm_or_warn(&c.store, &[&id, &reply_id]);
     print_written(format, "close", &id, &w);
     Ok(())
 }
