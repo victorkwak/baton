@@ -51,6 +51,7 @@ impl Net {
             name: name.to_owned(),
             root,
             agent: true,
+            env: Vec::new(),
         };
         std::fs::create_dir_all(m.config_dir()).unwrap();
         m.write_config(&self.url(), machines);
@@ -142,6 +143,8 @@ pub struct Machine {
     pub root: PathBuf,
     /// Run as a Claude Code agent (`CLAUDECODE=1`).
     pub agent: bool,
+    /// Extra environment for every command.
+    pub env: Vec<(String, String)>,
 }
 
 impl Machine {
@@ -198,6 +201,9 @@ impl Machine {
         } else {
             cmd.env_remove("CLAUDECODE")
                 .env_remove("CLAUDE_CODE_SESSION_ID");
+        }
+        for (k, v) in &self.env {
+            cmd.env(k, v);
         }
         cmd
     }

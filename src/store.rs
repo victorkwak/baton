@@ -488,11 +488,13 @@ impl Store {
         // on the new tip. Rule-bearing commits re-read and re-check.
         let mut plain: Option<Vec<Record>> = None;
         for attempt in 0..=RETRIES {
-            let online = match self.fetch() {
-                Ok(()) => true,
-                Err(e) if e.kind == Kind::Offline => false,
+            // Unreachable (offline, or refused for auth): plain messages queue.
+            let unreachable = match self.fetch() {
+                Ok(()) => None,
+                Err(e) if matches!(e.kind, Kind::Offline | Kind::Auth) => Some(e),
                 Err(e) => return Err(e),
             };
+            let online = unreachable.is_none();
             let (records, sha) = match &plain {
                 Some(records) if online => {
                     let origin = self.origin_tip()?;
@@ -504,13 +506,13 @@ impl Store {
                     let mut records = build(&snap.state)?;
                     records.sort_by(|a, b| a.id().cmp(b.id()));
                     let rule_bearing = records.iter().any(Record::rule_bearing);
-                    if !online && rule_bearing {
-                        return self.queue_offline(&records, rule_bearing, summary, "fetch");
+                    if let Some(cause) = unreachable {
+                        if !rule_bearing {
+                            snap.state.check_commit(&records)?;
+                        }
+                        return self.queue_offline(&records, rule_bearing, summary, "fetch", cause);
                     }
                     snap.state.check_commit(&records)?;
-                    if !online {
-                        return self.queue_offline(&records, rule_bearing, summary, "fetch");
-                    }
                     // Rebuild queued commits on the fetched tip, then add ours.
                     let mut tip = snap.origin.clone();
                     for q in &snap.queued_commits {
@@ -556,9 +558,9 @@ impl Store {
                     let jitter = random_u64() % (2u64 << attempt);
                     std::thread::sleep(Duration::from_millis(jitter));
                 }
-                Err(e) if e.kind == Kind::Offline => {
+                Err(e) if matches!(e.kind, Kind::Offline | Kind::Auth) => {
                     let rule_bearing = records.iter().any(Record::rule_bearing);
-                    return self.queue_offline(&records, rule_bearing, summary, "push");
+                    return self.queue_offline(&records, rule_bearing, summary, "push", e);
                 }
                 Err(e) => return Err(e),
             }
@@ -570,32 +572,88 @@ impl Store {
         )
     }
 
-    /// Offline: commit plain messages on local `main`; refuse anything else.
+    /// The remote is unreachable (`cause`: offline or auth): commit plain
+    /// messages on local `main` (queued); refuse anything else. Offline
+    /// queues quietly (it ends by itself); an auth refusal needs the human,
+    /// so it fails with exit 31 after queuing.
     fn queue_offline(
         &self,
         records: &[Record],
         rule_bearing: bool,
         summary: &str,
         step: &str,
+        cause: Error,
     ) -> Result<Written> {
+        let offline = cause.kind == Kind::Offline;
         if rule_bearing {
-            crate::fail!(
-                Offline,
-                "offline: the board remote is unreachable ({step}); {summary} needs the network, nothing was committed"
-            );
+            if offline {
+                crate::fail!(
+                    Offline,
+                    "offline: the board remote is unreachable ({step}); {summary} needs the network, nothing was committed"
+                );
+            }
+            return Err(Error::new(
+                cause.kind,
+                format!(
+                    "{}; {summary} needs the board remote, nothing was committed",
+                    cause.message
+                ),
+            ));
+        }
+        if records.is_empty() {
+            return Err(cause);
         }
         let main = self.rev(MAIN)?;
-        if records.is_empty() {
-            crate::fail!(Offline, "offline: the board remote is unreachable ({step})");
-        }
         let sha = self.commit(records, main.as_deref(), summary)?;
         self.git.run(["update-ref", MAIN, &sha])?;
-        eprintln!("baton: offline ({step}): committed locally; the next online write pushes it");
-        Ok(Written {
-            commit: sha,
-            queued: true,
-        })
+        if offline {
+            eprintln!(
+                "baton: offline ({step}): committed locally (queued); the next baton command that reaches the board remote pushes it"
+            );
+            return Ok(Written {
+                commit: sha,
+                queued: true,
+            });
+        }
+        let ids: Vec<&str> = records.iter().map(Record::id).collect();
+        Err(Error::new(
+            cause.kind,
+            format!(
+                "{}; {} is queued locally, not on the board remote: fix access to the board remote (`baton doctor`); the next baton command that reaches it pushes the queue",
+                cause.message,
+                ids.join(", ")
+            ),
+        ))
     }
+
+    /// Push posts queued on local `main` (see [`Store::push_cas`]). Returns
+    /// how many commits are still queued. Call it with the lock held.
+    pub fn deliver_queued(&self) -> Result<usize> {
+        if self.read()?.queued == 0 {
+            return Ok(0);
+        }
+        self.push_cas("deliver queued posts", |_| Ok(Vec::new()))?;
+        Ok(self.read()?.queued)
+    }
+
+    /// [`Store::deliver_queued`], best effort: errors are ignored (the
+    /// caller warns while posts stay queued). Returns the commits still
+    /// queued.
+    pub fn deliver_queued_quietly(&self) -> usize {
+        match self.deliver_queued() {
+            Ok(n) => n,
+            Err(_) => self.read().map(|s| s.queued).unwrap_or(0),
+        }
+    }
+}
+
+/// The stderr warning while posts are queued locally.
+pub fn queued_warning(queued: usize) -> Option<String> {
+    (queued > 0).then(|| {
+        format!(
+            "baton: {queued} post(s) are queued locally and not yet on the board remote; the next baton command that reaches the remote pushes them (check `baton doctor`)"
+        )
+    })
 }
 
 #[derive(Debug)]

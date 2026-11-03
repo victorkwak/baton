@@ -218,7 +218,14 @@ fn wait() -> Result<()> {
                     Err(e) => return Err(e),
                 }
             }
-            store.read()?
+            let snap = store.read()?;
+            if snap.queued > 0 {
+                // Queued posts must not sit until the next write.
+                store.deliver_queued_quietly();
+                store.read()?
+            } else {
+                snap
+            }
         };
         if !live(&arming, &snap.state) {
             return Ok(());

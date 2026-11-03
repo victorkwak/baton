@@ -97,7 +97,7 @@ Order = first-parent commit order on `main`. Within one commit, files sort by id
 
 **Branch ownership** (code work in other repos): the owner of `repo:name` is the `to` of the latest `handover` message carrying that branch.
 
-**Online only:** plan, handover, close-task, take, release and close need the network. A plain message may be committed offline and is pushed later.
+**Online only:** plan, handover, close-task, take, release and close need the network. A plain message may be committed locally (queued) when the remote cannot be reached: offline, it prints its id with a warning (exit 0); refused for auth or permissions, it exits 31 and says the message is queued locally. **Queued posts are delivered** by the next write, and also by `inbox`, `tasks`, `doctor` and the waiter, which try to push them (quietly when that fails). While any stay queued, `inbox` and `tasks` warn on stderr and `doctor` fails its `board-queue` check.
 
 **Secrets:** before a post, scan every field and the body for known patterns: PEM private keys, `glpat-`, `ghp_`/`github_pat_`, `sk-ant-`, `xox[bp]-`, and AWS secret keys next to `AKIA`/`ASIA`. Generic high-entropy text and hex SHAs are allowed. A match refuses (exit 11). Only the human can override.
 
@@ -138,7 +138,7 @@ Data goes to stdout, diagnostics to stderr. With no TTY, nothing prompts. Every 
 | 21 | `sync`: commit conflict |
 | 22 | `sync`: check command failed (before commit, or on the merged tree) |
 | 30 | Offline |
-| 31 | SSH auth failure |
+| 31 | Auth failure, or the remote refused for permissions (a plain post is queued locally) |
 | 32 | Remote error, or the push lost the race 3 times |
 | 40 | Repo state needs the human (wrong branch, rebase in progress, shallow clone, unrelated history) |
 

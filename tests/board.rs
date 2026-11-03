@@ -922,3 +922,97 @@ fn records_that_break_a_rule_are_ignored_by_every_machine() {
     // The addressee can still close it.
     laptop.run(&["close", &id]).ok();
 }
+
+/// A fake `ssh` for `GIT_SSH_COMMAND`: runs the git command it is given
+/// locally (so `ssh://host/<abs path>` reaches a local bare repo), but
+/// while `<dir>/refuse-push` exists it refuses `git-receive-pack` with
+/// GitHub's wording for a key without write access.
+fn fake_ssh(dir: &std::path::Path) -> (String, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let script = dir.join("fake-ssh");
+    let refuse = dir.join("refuse-push");
+    std::fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+case "$1" in -G) exit 0;; esac
+for a; do last="$a"; done
+case "$last" in
+  git-receive-pack*)
+    if [ -e '{refuse}' ]; then
+      echo 'ERROR: Permission to me/board.git denied to deploy-bot.' >&2
+      exit 1
+    fi;;
+esac
+exec sh -c "$last"
+"#,
+            refuse = refuse.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (script.to_str().unwrap().to_owned(), refuse)
+}
+
+#[test]
+fn a_push_refused_for_permissions_is_auth_and_the_queue_is_delivered_by_inbox() {
+    let (net, _ws, laptop) = pair();
+    let for_ws = laptop.post("ws", "for ws", &[]);
+    let tools = tempfile::TempDir::new().unwrap();
+    let (ssh, refuse) = fake_ssh(tools.path());
+    let url = format!("ssh://git@github.invalid{}", net.bare.display());
+    // ws reaches the board over (fake) SSH.
+    let mut ws = net.machine("ws", TWO);
+    ws.write_config(&url, TWO);
+    ws.env.push(("GIT_SSH_COMMAND".into(), ssh));
+    ws.run(&["inbox"]).ok();
+    let before = net.history().len();
+
+    std::fs::write(&refuse, "").unwrap();
+    // A plain post: exit 31 (auth, not offline), and it says it is queued.
+    let err = ws
+        .run(&["post", "--to", "laptop", "-m", "x", "while refused"])
+        .code(31);
+    assert!(err.contains("Permission to"), "{err}");
+    assert!(err.contains("queued locally"), "{err}");
+    assert!(!err.contains("offline"), "{err}");
+    assert_eq!(net.history().len(), before);
+    // A rule-bearing record: exit 31, nothing committed.
+    let err = ws.run(&["take", &for_ws]).code(31);
+    assert!(err.contains("nothing was committed"), "{err}");
+
+    // While queued, inbox and tasks warn on stderr, and still work.
+    let r = ws.run(&["inbox"]);
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(r.stderr.contains("queued locally"), "{r:?}");
+    assert!(r.stdout.contains(&for_ws), "{r:?}");
+    let r = ws.run(&["tasks"]);
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(r.stderr.contains("queued locally"), "{r:?}");
+
+    // doctor tries too, and reports what stays queued.
+    let v = ws.run(&["--format", "json", "doctor"]).json();
+    let queue = v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["check"] == "board-queue")
+        .unwrap()
+        .clone();
+    assert_eq!(queue["status"], "fail", "{queue}");
+    assert!(
+        queue["detail"].as_str().unwrap().contains("queued locally"),
+        "{queue}"
+    );
+
+    // Access fixed: the next inbox delivers the queued post, then is quiet.
+    std::fs::remove_file(&refuse).unwrap();
+    let r = ws.run(&["inbox"]);
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(!r.stderr.contains("queued"), "{r:?}");
+    assert_eq!(net.history().len(), before + 1);
+    assert_eq!(laptop.inbox_ids(false).len(), 1);
+    let r = ws.run(&["inbox"]);
+    assert_eq!(r.stderr, "", "{r:?}");
+    assert_eq!(net.history().len(), before + 1);
+}

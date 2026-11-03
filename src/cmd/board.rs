@@ -208,11 +208,25 @@ fn warn_rejected(state: &State) {
     }
 }
 
+/// Fetch and read; when posts are queued and the remote was reached, try
+/// to push them (quietly) first. Warns on stderr while any stay queued.
+fn fetch_read_deliver(store: &Store) -> Result<crate::store::Snapshot> {
+    let online = store.fetch_or_warn()?;
+    let mut snap = store.read()?;
+    if snap.queued > 0 && online {
+        store.deliver_queued_quietly();
+        snap = store.read()?;
+    }
+    if let Some(w) = crate::store::queued_warning(snap.queued) {
+        eprintln!("{w}");
+    }
+    Ok(snap)
+}
+
 pub fn inbox(format: Format, args: InboxArgs) -> Result<()> {
     let c = ctx()?;
     let _lock = c.store.lock()?;
-    c.store.fetch_or_warn()?;
-    let snap = c.store.read()?;
+    let snap = fetch_read_deliver(&c.store)?;
     warn_rejected(&snap.state);
     let msgs = snap.state.inbox(c.who.machine(), args.all);
     print_messages(format, "inbox", &msgs);
@@ -594,8 +608,7 @@ pub fn wait(format: Format, args: WaitArgs) -> Result<()> {
 pub fn tasks(format: Format) -> Result<()> {
     let c = ctx()?;
     let _lock = c.store.lock()?;
-    c.store.fetch_or_warn()?;
-    let snap = c.store.read()?;
+    let snap = fetch_read_deliver(&c.store)?;
     warn_rejected(&snap.state);
     let now = jiff::Timestamp::now();
     let rows = snap.state.task_summaries(now);
