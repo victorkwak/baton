@@ -149,6 +149,9 @@ pub struct Parent {
     claude: Option<u32>,
     /// The parent pid at start.
     ppid: u32,
+    /// When `claude` was last seen alive (without `/proc` the check runs
+    /// a process, so it is not repeated more than once a second).
+    seen: std::cell::Cell<Option<std::time::Instant>>,
 }
 
 impl Parent {
@@ -159,20 +162,43 @@ impl Parent {
                 .and_then(|v| v.trim().parse::<u32>().ok())
                 .filter(|&p| p > 1),
             ppid: std::os::unix::process::parent_id(),
+            seen: std::cell::Cell::new(None),
         }
     }
 
     /// Still there: the parent pid has not changed (a dead parent's
     /// children are re-parented), and `CLAUDE_PID`, if known, is alive.
     pub fn alive(&self) -> bool {
-        std::os::unix::process::parent_id() == self.ppid && self.claude.is_none_or(pid_alive)
+        if std::os::unix::process::parent_id() != self.ppid {
+            return false;
+        }
+        let Some(pid) = self.claude else {
+            return true;
+        };
+        // `/proc` is cheap: always look. `kill -0` runs a process: at most
+        // once a second (so a wake may follow a gone parent by up to 1 s).
+        let recent = !has_proc()
+            && self
+                .seen
+                .get()
+                .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(1));
+        if recent {
+            return true;
+        }
+        let alive = pid_alive(pid);
+        self.seen.set(alive.then(std::time::Instant::now));
+        alive
     }
 }
 
 /// Is process `pid` running (not a zombie)? `/proc` where there is one,
 /// else `kill -0`.
+fn has_proc() -> bool {
+    Path::new("/proc/self/stat").exists()
+}
+
 fn pid_alive(pid: u32) -> bool {
-    if Path::new("/proc/self/stat").exists() {
+    if has_proc() {
         // `<pid> (<comm>) <state> ...`; comm may hold spaces and parens.
         return std::fs::read_to_string(format!("/proc/{pid}/stat"))
             .ok()
