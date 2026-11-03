@@ -89,6 +89,11 @@ pub struct Arming {
     /// message outside any task expires after [`ARMING_TTL_SECS`].
     #[serde(default)]
     pub armed_at: BTreeMap<String, i64>,
+    /// `baton on` (and `/baton`): listening. Any new message for this
+    /// machine at or after this board position wakes the session, plans
+    /// too, until `baton off`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen: Option<usize>,
     /// `baton off`: never wake this session, until `baton on`. Arming
     /// still records tasks and messages, so `on` resumes them.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -101,7 +106,7 @@ pub const ARMING_TTL_SECS: i64 = 7 * 24 * 3600;
 
 impl Arming {
     pub fn is_empty(&self) -> bool {
-        self.tasks.is_empty() && self.messages.is_empty()
+        self.tasks.is_empty() && self.messages.is_empty() && self.listen.is_none()
     }
 
     /// Union; the earliest position wins.
@@ -120,6 +125,10 @@ impl Arming {
             *e = (*e).max(*v);
         }
         self.off |= other.off;
+        self.listen = match (self.listen, other.listen) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
     }
 
     fn path(key: &str) -> Result<PathBuf> {
@@ -287,10 +296,12 @@ pub fn arm(store: &Store, ids: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Turn waking off (or back on) for this agent session, under every key
-/// its environment names and every key it was armed under. Returns those
-/// keys; empty outside Claude Code or without a session key.
-pub fn set_off(off: bool) -> Result<Vec<String>> {
+/// Turn listening on from board position `listen` (`Some`), or waking off
+/// (`None`), for this agent session, under every key its environment names
+/// and every key it was armed under. A session already listening keeps its
+/// earlier position. Returns those keys; empty outside Claude Code or
+/// without a session key.
+pub fn set_listen(listen: Option<usize>) -> Result<Vec<String>> {
     let mut keys = env_keys();
     if !crate::identity::is_agent() || keys.is_empty() {
         return Ok(Vec::new());
@@ -310,7 +321,11 @@ pub fn set_off(off: bool) -> Result<Vec<String>> {
     }
     for key in &keys {
         let mut a = Arming::load(key)?;
-        a.off = off;
+        a.off = listen.is_none();
+        a.listen = match (listen, a.listen) {
+            (Some(new), Some(old)) => Some(new.min(old)),
+            (new, _) => new,
+        };
         a.keys.extend(keys.iter().cloned());
         let text = serde_json::to_vec_pretty(&a).map_err(anyhow::Error::from)?;
         write_atomic(&Arming::path(key)?, &text)?;

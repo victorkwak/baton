@@ -36,17 +36,30 @@ pub fn hook(cmd: HookCommand) -> Result<()> {
     }
 }
 
-/// `baton off` / `baton on`: stop or resume waking this session. `off`
-/// also ends its running waiter (a newer generation) within a second.
+/// `baton on` / `baton off`: listen for every new message to this
+/// machine, or stop waking this session. `off` also ends its running
+/// waiter (a newer generation) within a second.
 pub fn set_waking(format: crate::Format, on: bool) -> Result<()> {
-    let keys = crate::hooks::set_off(!on)?;
-    let Some(primary) = keys.first() else {
+    let name = if on { "on" } else { "off" };
+    if !crate::identity::is_agent() || crate::hooks::env_keys().is_empty() {
         crate::fail!(
             Internal,
-            "`baton {}` is for an agent session inside Claude Code",
-            if on { "on" } else { "off" }
+            "`baton {name}` is for an agent session inside Claude Code"
         );
+    }
+    let config = Config::load()?;
+    let listen = if on {
+        // From the remote's current position: what is already there was
+        // shown by `inbox`; anything newer wakes.
+        let store = Store::open(&config, "")?;
+        let _l = store.lock()?;
+        let _ = store.fetch();
+        Some(store.read()?.remote_len)
+    } else {
+        None
     };
+    let keys = crate::hooks::set_listen(listen)?;
+    let primary = keys.first().cloned().unwrap_or_default();
     if !on {
         let dir = sessions_dir()?;
         for k in &keys {
@@ -57,15 +70,16 @@ pub fn set_waking(format: crate::Format, on: bool) -> Result<()> {
         crate::Format::Json => crate::out!(
             "{}",
             crate::output::envelope(
-                if on { "on" } else { "off" },
-                serde_json::json!([{"session": primary, "waking": on}])
+                name,
+                serde_json::json!([{"session": primary, "listening": on}])
             )
         ),
         crate::Format::Text if on => crate::out!(
-            "baton: waking is on for this session; replies in its tasks wake it again after this turn"
+            "baton: listening: a new message for {} wakes this session when it is idle, until `baton off`",
+            config.machine
         ),
         crate::Format::Text => crate::out!(
-            "baton: waking is off for this session; posts still work. `baton on` turns it back on"
+            "baton: waking is off for this session; posts still work. `baton on` (or /baton) turns listening on"
         ),
     }
     Ok(())
@@ -210,11 +224,18 @@ fn nap(until: Instant, keep: &dyn Fn() -> bool) -> bool {
 }
 
 /// Does `m` wake a session armed with `arming`? Open, addressed to this
-/// machine (or an unclaimed `any`), not this machine's own, not a plan or
-/// `close-task`, and in an armed task (or a reply to an armed message),
-/// added after that arming.
+/// machine (or an unclaimed `any`), not this machine's own, not a
+/// `close-task`, and added after the arming: any such message while the
+/// session listens; otherwise one in an armed task (or a reply to an armed
+/// message) that is not a plan.
 fn wakes(m: &MsgState, arming: &Arming, machine: &str) -> bool {
-    if !m.actionable_for(machine) || matches!(m.msg.kind, MsgKind::Plan | MsgKind::CloseTask) {
+    if arming.off || !m.actionable_for(machine) || m.msg.kind == MsgKind::CloseTask {
+        return false;
+    }
+    if arming.listen.is_some_and(|p| m.seq >= p) {
+        return true;
+    }
+    if m.msg.kind == MsgKind::Plan {
         return false;
     }
     let by_task =
@@ -228,19 +249,22 @@ fn wakes(m: &MsgState, arming: &Arming, machine: &str) -> bool {
 }
 
 fn wake_key(m: &MsgState) -> String {
-    if m.msg.task.is_empty() {
+    if m.msg.task.is_empty() && m.msg.reply_to.is_empty() {
+        format!("msg:{}", m.msg.id)
+    } else if m.msg.task.is_empty() {
         format!("reply:{}", m.msg.reply_to)
     } else {
         m.msg.task.clone()
     }
 }
 
-/// Anything left to wait for: an armed task still open, an armed message
+/// Anything left to wait for: listening, an armed task still open, an armed message
 /// in an open task, or an armed message outside any task that is not
 /// closed and was armed less than [`ARMING_TTL_SECS`] ago.
 fn live(arming: &Arming, state: &State, now: i64) -> bool {
     let open = |task: &str| state.task(task).is_none_or(|t| !t.closed);
-    arming.tasks.keys().any(|t| open(t))
+    arming.listen.is_some()
+        || arming.tasks.keys().any(|t| open(t))
         || arming.messages.keys().any(|id| match state.message(id) {
             // Not fetched yet.
             None => true,
@@ -381,6 +405,7 @@ fn wait() -> Result<()> {
                 .tasks
                 .values()
                 .chain(arming.messages.values())
+                .chain(arming.listen.iter())
                 .copied()
                 .min()
                 .unwrap_or(snap.remote_len)

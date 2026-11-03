@@ -1608,7 +1608,7 @@ fn off_silences_a_session_and_ends_its_waiter_until_on() {
 
     // `on`: the next waiter wakes for what arrived meanwhile.
     let out = as_session(&ws, &["on"], Some("host-1"), "ws-s1");
-    assert!(out.contains("waking is on"), "{out}");
+    assert!(out.contains("listening"), "{out}");
     let run = finish(
         spawn_waiter(&ws, "ws-s1", Some("host-1"), &[]),
         Duration::from_secs(20),
@@ -1619,4 +1619,49 @@ fn off_silences_a_session_and_ends_its_waiter_until_on() {
     let mut plain = ws.clone();
     plain.agent = false;
     plain.run(&["off"]).code(1);
+}
+
+#[test]
+fn on_listens_for_every_new_message_until_off() {
+    let (_net, ws, laptop) = pair();
+    let old = laptop.post("ws", "already there", &[]);
+    // No arming yet: the waiter has nothing to wait for.
+    let run = finish(
+        spawn_waiter(&ws, "ws-s1", Some("host-1"), &[]),
+        Duration::from_secs(5),
+    );
+    assert_eq!(run.code, 0, "{run:?}");
+
+    let out = as_session(&ws, &["on"], Some("host-1"), "ws-s1");
+    assert!(out.contains("listening"), "{out}");
+    // What was already there does not wake; a new plan does.
+    let mut waiter = spawn_waiter(&ws, "ws-s1", Some("host-1"), &[]);
+    still_running(&mut waiter, Duration::from_millis(1500));
+    let plan = laptop.post("ws", "new work", &["--task", "t9", "--plan"]);
+    let run = finish(waiter, Duration::from_secs(20));
+    assert_eq!(run.code, 2, "{run:?}");
+    assert_eq!(woken_ids(&run.stderr), vec![plan.clone()]);
+    assert!(!run.stderr.contains(&old), "{}", run.stderr);
+
+    // Still listening after the wake: a plain message to `any` wakes too,
+    // even in a restarted CLI (same host id).
+    let mut waiter = spawn_waiter(&ws, "ws-s2", Some("host-1"), &[]);
+    still_running(&mut waiter, Duration::from_millis(1500));
+    let any = laptop.post("any", "anyone free?", &[]);
+    let run = finish(waiter, Duration::from_secs(20));
+    assert_eq!(run.code, 2, "{run:?}");
+    assert_eq!(woken_ids(&run.stderr), vec![any]);
+
+    // `off` ends listening and the running waiter.
+    let mut waiter = spawn_waiter(&ws, "ws-s2", Some("host-1"), &[]);
+    still_running(&mut waiter, Duration::from_millis(1500));
+    as_session(&ws, &["off"], Some("host-1"), "ws-s2");
+    let run = finish(waiter, Duration::from_secs(5));
+    assert_eq!(run.code, 0, "{run:?}");
+    laptop.post("ws", "after off", &[]);
+    let run = finish(
+        spawn_waiter(&ws, "ws-s2", Some("host-1"), &[]),
+        Duration::from_secs(5),
+    );
+    assert_eq!(run.code, 0, "{run:?}");
 }

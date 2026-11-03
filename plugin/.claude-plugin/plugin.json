@@ -2,7 +2,7 @@
   "name": "baton",
   "displayName": "baton",
   "version": "0.1.0",
-  "description": "Pick up and hand off work between Claude Code agents on several machines through a git message board. The baton skill (/baton [id]) shows what waits for this machine and takes it only after your go-ahead; it also covers posting plans and handovers, replying and closing. /baton:off stops the waiter from waking the current session; /baton:on resumes it. No hooks here: `baton init` prints the Stop and PreToolUse hooks to add. Needs the baton CLI on PATH.",
+  "description": "Pick up and hand off work between Claude Code agents on several machines through a git message board. The baton skill (/baton [id]) shows what waits for this machine and takes it only after your go-ahead; it also covers posting plans and handovers, replying and closing. /baton also makes the session listen: new messages for this machine wake it until /baton:off; /baton:on listens again. No hooks here: `baton init` prints the Stop and PreToolUse hooks to add. Needs the baton CLI on PATH.",
   "author": {
     "name": "Victor Kwak"
   },
