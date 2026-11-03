@@ -497,7 +497,8 @@ impl Lexer {
                     }
                 }
                 '{' if self.word.is_none()
-                    && self.cur.is_empty()
+                    && (self.cur.is_empty()
+                        || (self.cur.len() == 2 && self.cur[0].text == "function"))
                     && self.peek(1).is_none_or(char::is_whitespace) =>
                 {
                     self.end_cmd();
@@ -875,6 +876,9 @@ pub struct GitCall {
     /// Global options that change how git runs commands (`--config-env`,
     /// `--exec-path`), or that this parser does not know.
     pub risky_globals: bool,
+    /// An environment variable that changes what git runs or where it
+    /// pushes (`GIT_CONFIG_*`, `GIT_PAGER`, `GIT_SSH_COMMAND`, ...).
+    pub risky_env: bool,
     /// The subcommand; `None` when there is none or it is unknown.
     pub sub: Option<String>,
     /// `true` when the subcommand cannot be read (an expansion, or
@@ -893,6 +897,9 @@ pub enum Invocation {
     Other {
         dir: Option<PathBuf>,
         words: Vec<Word>,
+        /// No `PATH` change, function, alias or sourced file before it:
+        /// a bare program name means what `PATH` says.
+        trusted_path: bool,
     },
     /// A program whose name is an expansion (`$GIT push`): the words.
     Opaque(String),
@@ -915,6 +922,35 @@ fn assignment(w: &Word) -> Option<(&str, &str)> {
 }
 
 const GIT_LOCATION_VARS: &[&str] = &["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"];
+
+/// Environment variables that act like `-c` or `--exec-path`: they change
+/// what git runs, which config it reads, or where it pushes.
+pub fn risky_var(name: &str) -> bool {
+    name.starts_with("GIT_CONFIG")
+        || matches!(
+            name,
+            "GIT_PAGER"
+                | "PAGER"
+                | "GIT_EXTERNAL_DIFF"
+                | "GIT_EXEC_PATH"
+                | "GIT_SSH_COMMAND"
+                | "GIT_SSH"
+                | "GIT_ASKPASS"
+                | "SSH_ASKPASS"
+                | "GIT_EDITOR"
+                | "EDITOR"
+                | "VISUAL"
+                | "GIT_SEQUENCE_EDITOR"
+                | "GIT_TEMPLATE_DIR"
+                | "GIT_ALTERNATE_OBJECT_DIRECTORIES"
+                | "GIT_OBJECT_DIRECTORY"
+                | "GIT_INDEX_FILE"
+                | "GIT_NAMESPACE"
+                | "GIT_PROXY_COMMAND"
+                | "GIT_TRACE2_EVENT"
+                | "LESSOPEN"
+        )
+}
 
 /// Expand `~`; `None` for an expansion or `~user`.
 fn word_path(w: &Word) -> Option<PathBuf> {
@@ -976,6 +1012,8 @@ pub fn invocations(command: &str, cwd: &Path) -> std::result::Result<Vec<Invocat
     let mut w = Walker {
         out: Vec::new(),
         env_unknown: false,
+        env_risky: false,
+        path_tainted: false,
         cond: 0,
         depth: 0,
     };
@@ -987,6 +1025,12 @@ struct Walker {
     out: Vec<Invocation>,
     /// `GIT_DIR` and friends were set for the rest of the command.
     env_unknown: bool,
+    /// A variable that changes what git runs (`GIT_CONFIG_*`, `GIT_PAGER`,
+    /// ...) was set for the rest of the command.
+    env_risky: bool,
+    /// `PATH`, a function, an alias or a sourced file may have redefined
+    /// `baton` for the rest of the command.
+    path_tainted: bool,
     /// Inside `if`/`while`/`until`/`for`: every `cd` is conditional.
     cond: usize,
     depth: usize,
@@ -1019,12 +1063,10 @@ impl Walker {
             if item.sep == Sep::Pipe && prev != Sep::Pipe {
                 pipe_in = input.clone();
             }
-            let unreachable = input.as_ref().is_some_and(|s| s.is_empty());
-            let (mut s, mut f) = if unreachable {
-                (input.clone(), input.clone())
-            } else {
-                self.node(&item.node, input.clone(), prev == Sep::Pipe)?
-            };
+            // Every command is checked: reachability (an `exit` that may
+            // or may not run) only ever adds directories, never removes a
+            // command from checking.
+            let (mut s, mut f) = self.node(&item.node, input.clone(), prev == Sep::Pipe)?;
             if in_pipe || item.sep == Sep::Amp {
                 // A pipeline element or a background job runs in a subshell.
                 s = input.clone();
@@ -1053,6 +1095,10 @@ impl Walker {
     ) -> std::result::Result<(Cands, Cands), String> {
         match node {
             Node::Group { list, subshell } => {
+                if *subshell && list.is_empty() {
+                    // `name() { ... }`: a function may shadow a program.
+                    self.path_tainted = true;
+                }
                 self.depth += 1;
                 if self.depth > MAX_DEPTH {
                     return Err("command nests too deeply".into());
@@ -1104,6 +1150,8 @@ impl Walker {
         let mut git_dir = Spec::Unset;
         let mut work_tree = Spec::Unset;
         let mut stdin_args = false;
+        let mut risky_env = false;
+        let mut path_local = false;
         let spec = |value: &str, w: &Word, dirs: &Cands| -> Spec {
             if w.dynamic {
                 return Spec::Unknown;
@@ -1125,6 +1173,20 @@ impl Walker {
                 let (name, value) = (name.to_owned(), value.to_owned());
                 let w = words.remove(0);
                 let only_assignments = words.iter().all(|w| assignment(w).is_some());
+                if risky_var(&name) {
+                    if only_assignments {
+                        self.env_risky = true;
+                    } else {
+                        risky_env = true;
+                    }
+                }
+                if name == "PATH" {
+                    if only_assignments {
+                        self.path_tainted = true;
+                    } else {
+                        path_local = true;
+                    }
+                }
                 if GIT_LOCATION_VARS.contains(&name.as_str()) {
                     if only_assignments {
                         // A shell variable for the rest of the command.
@@ -1260,6 +1322,8 @@ impl Walker {
         if self.env_unknown {
             git_dir = Spec::Unknown;
         }
+        let risky_env = risky_env || self.env_risky;
+        let trusted_path = !path_local && !self.path_tainted;
         let Some(first) = words.first().cloned() else {
             return same();
         };
@@ -1276,11 +1340,6 @@ impl Walker {
             "fi" | "done" | "esac" => {
                 self.cond = self.cond.saturating_sub(1);
                 same()
-            }
-            "exit" | "return" if !piped => {
-                // Nothing after it runs.
-                let none: Cands = Some(std::collections::BTreeSet::new());
-                Ok((none.clone(), none))
             }
             "for" | "select" | "case" => {
                 self.cond += 1;
@@ -1323,20 +1382,33 @@ impl Walker {
                 // this parser cannot follow.
                 if basename(&first.text) != "popd" {
                     self.env_unknown = true;
+                    self.env_risky = true;
+                    self.path_tainted = true;
                 }
                 self.emit_each(&dirs, |dir| Invocation::Other {
                     dir,
                     words: words.clone(),
+                    trusted_path,
                 });
                 Ok((None, input))
             }
             "export" | "declare" | "typeset" | "local" | "readonly" => {
-                if words[1..].iter().any(|w| {
+                for w in &words[1..] {
                     let name = w.text.split('=').next().unwrap_or("");
-                    w.dynamic || GIT_LOCATION_VARS.contains(&name)
-                }) {
-                    self.env_unknown = true;
+                    if w.dynamic || GIT_LOCATION_VARS.contains(&name) {
+                        self.env_unknown = true;
+                    }
+                    if w.dynamic || risky_var(name) {
+                        self.env_risky = true;
+                    }
+                    if w.dynamic || name == "PATH" || w.text == "-f" {
+                        self.path_tainted = true;
+                    }
                 }
+                same()
+            }
+            "alias" | "function" | "hash" | "enable" => {
+                self.path_tainted = true;
                 same()
             }
             "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish" => {
@@ -1362,14 +1434,9 @@ impl Walker {
                 let rest = words[1..].to_vec();
                 let (gd, wt) = (git_dir.clone(), work_tree.clone());
                 self.emit_each(&dirs, |dir| {
-                    Invocation::Git(parse_git(
-                        &rest,
-                        dir,
-                        gd.clone(),
-                        wt.clone(),
-                        stdin_args,
-                        false,
-                    ))
+                    let mut g = parse_git(&rest, dir, gd.clone(), wt.clone(), stdin_args, false);
+                    g.risky_env = risky_env;
+                    Invocation::Git(g)
                 });
                 same()
             }
@@ -1393,12 +1460,15 @@ impl Walker {
                     let rest = words[p + 2..].to_vec();
                     let (gd, wt) = (git_dir.clone(), work_tree.clone());
                     self.emit_each(&dirs, |dir| {
-                        Invocation::Git(parse_git(&rest, dir, gd.clone(), wt.clone(), true, true))
+                        let mut g = parse_git(&rest, dir, gd.clone(), wt.clone(), true, true);
+                        g.risky_env = risky_env;
+                        Invocation::Git(g)
                     });
                 }
                 self.emit_each(&dirs, |dir| Invocation::Other {
                     dir,
                     words: words.clone(),
+                    trusted_path,
                 });
                 same()
             }
@@ -1472,6 +1542,7 @@ impl Walker {
             self.emit_each(dirs, |dir| Invocation::Other {
                 dir,
                 words: words.to_vec(),
+                trusted_path: false,
             });
             return Ok(());
         }
@@ -1535,6 +1606,7 @@ pub fn parse_git(
         work_tree,
         configs: Vec::new(),
         risky_globals: false,
+        risky_env: false,
         sub: None,
         sub_unknown: false,
         args: Vec::new(),
@@ -2074,7 +2146,12 @@ mod tests {
         assert_eq!(dirs("echo $(cd /a); git status", "/s"), vec![p("/s")]);
         // `cd X || exit` style: after `||`, the next command runs only if cd failed.
         assert_eq!(dirs("cd /a || git status", "/s"), vec![p("/s")]);
-        assert_eq!(dirs("cd /a || exit 1; git status", "/s"), vec![p("/a")]);
+        // `exit` never hides a later command; it can only add directories.
+        assert_eq!(
+            dirs("cd /a || exit 1; git status", "/s"),
+            vec![p("/a"), p("/s")]
+        );
+        assert_eq!(dirs("f() { exit; }; git status", "/s"), vec![p("/s")]);
         // Conditional cd: both places afterwards.
         assert_eq!(
             dirs("if true; then cd /a; fi; git status", "/s"),

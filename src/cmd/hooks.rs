@@ -465,12 +465,8 @@ fn bash(cmd: &str, cwd: &Path, ctx: &mut GuardCtx, d: &mut Decision) {
     let invs = match invocations(cmd, cwd) {
         Ok(v) => v,
         Err(e) => {
-            let board = ctx.board.as_deref().is_some_and(|b| mentions(cmd, b));
-            if cmd.contains("git") || board {
-                d.ask(format!(
-                    "cannot parse this command ({e}) to check its git use"
-                ));
-            }
+            // Unsure what it runs, or where: ask.
+            d.ask(format!("cannot parse this command ({e}) to check it"));
             return;
         }
     };
@@ -482,13 +478,17 @@ fn bash(cmd: &str, cwd: &Path, ctx: &mut GuardCtx, d: &mut Decision) {
                 }
             }
             Invocation::Unknown(why) => d.ask(why),
-            Invocation::Other { dir, words } => {
+            Invocation::Other {
+                dir,
+                words,
+                trusted_path,
+            } => {
                 let Some(board) = ctx.board.clone() else {
                     continue;
                 };
                 if words
                     .first()
-                    .is_some_and(|w| is_real_baton(w, dir.as_deref()))
+                    .is_some_and(|w| trusted_path && is_real_baton(w, dir.as_deref()))
                 {
                     continue;
                 }
@@ -565,7 +565,11 @@ fn notes_read_only(g: &GitCall) -> Option<bool> {
     if !NOTES_READ_ONLY.contains(&sub) {
         return Some(false);
     }
-    if !g.configs.is_empty() || g.risky_globals || g.args.iter().any(|a| unsafe_read_arg(sub, a)) {
+    if !g.configs.is_empty()
+        || g.risky_globals
+        || g.risky_env
+        || g.args.iter().any(|a| unsafe_read_arg(sub, a))
+    {
         return None;
     }
     Some(true)
@@ -656,6 +660,9 @@ fn other_repo(g: &GitCall, top: Option<&Path>, ctx: &mut GuardCtx, d: &mut Decis
             }) {
                 d.ask("`-c` overrides where or what the push sends");
             }
+            if g.risky_env {
+                d.ask("environment variables that change git's config, programs or transport");
+            }
             if g.git_dir != Spec::Unset || g.work_tree != Spec::Unset {
                 d.ask("a push with an explicit git dir or work tree");
             }
@@ -703,6 +710,7 @@ fn other_repo(g: &GitCall, top: Option<&Path>, ctx: &mut GuardCtx, d: &mut Decis
                             );
                             expanded.configs.extend(g.configs.iter().cloned());
                             expanded.risky_globals |= g.risky_globals;
+                            expanded.risky_env |= g.risky_env;
                             other_repo(&expanded, top, ctx, d, depth + 1);
                         }
                         _ => d.ask(format!("git alias {} cannot be read", field(s))),

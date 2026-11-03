@@ -981,3 +981,194 @@ fn guard_exempts_only_the_real_baton() {
     );
     assert_eq!(decision(&d), Some("ask"));
 }
+
+#[test]
+fn guard_checks_commands_after_exit() {
+    let s = guard_setup();
+    let (ws, n, repo) = (&s.ws, s.notes.to_str().unwrap(), &s.repo);
+    for cmd in [
+        format!("bash -c 'f(){{ exit; }}; git -C {n} commit -m x'"),
+        format!("f() {{ exit 0; }}; git -C {n} commit -m x"),
+        format!("{{ exit 0; }}; git -C {n} commit -m x"),
+        format!("if false; then exit; fi; git -C {n} commit -m x"),
+        format!("true || exit; git -C {n} commit -m x"),
+        format!("exit 0; git -C {n} commit -m x"),
+        format!("(exit 1) && git -C {n} add ."),
+    ] {
+        assert_eq!(decision(&bash(ws, &cmd, repo)), Some("deny"), "{cmd}");
+    }
+}
+
+#[test]
+fn guard_treats_git_env_variables_like_config_options() {
+    let s = guard_setup();
+    let (ws, laptop, notes, repo) = (&s.ws, &s.laptop, &s.notes, &s.repo);
+    // Read-only commands in the notes repo with a risky variable ask.
+    for cmd in [
+        "GIT_PAGER='sh -c evil' git log",
+        "PAGER=evil git show HEAD",
+        "GIT_EXTERNAL_DIFF=/tmp/x git diff",
+        "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.pager GIT_CONFIG_VALUE_0=evil git log",
+        "GIT_CONFIG_PARAMETERS=\"'core.pager'='evil'\" git log",
+        "GIT_CONFIG_GLOBAL=/tmp/evil git status",
+        "GIT_EXEC_PATH=/tmp git status",
+        "env GIT_PAGER=evil git log",
+        "export GIT_PAGER=evil; git log",
+        "GIT_PAGER=evil; git log",
+        "declare -x GIT_CONFIG_SYSTEM=/tmp/x\ngit status",
+        "GIT_INDEX_FILE=/tmp/i git status",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES=/tmp git log",
+        "GIT_NAMESPACE=x git log",
+    ] {
+        assert_eq!(decision(&bash(ws, cmd, notes)), Some("ask"), "{cmd}");
+    }
+    // A push elsewhere with one asks; a plain commit does not.
+    for cmd in [
+        "GIT_SSH_COMMAND='ssh -i k' git push origin feat",
+        "GIT_SSH=/tmp/x git push origin feat",
+        "GIT_ASKPASS=/tmp/x git push origin feat",
+        "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.push GIT_CONFIG_VALUE_0=refs/heads/feat:refs/heads/main git push",
+        "export GIT_CONFIG_GLOBAL=/tmp/g; git push origin feat",
+        "GIT_TEMPLATE_DIR=/tmp/t git push origin feat",
+    ] {
+        assert_eq!(decision(&bash(laptop, cmd, repo)), Some("ask"), "{cmd}");
+    }
+    assert_eq!(bash(laptop, "GIT_EDITOR=vim git commit", repo), None);
+    assert_eq!(bash(ws, "LANG=C git log", notes), None);
+}
+
+#[test]
+fn guard_does_not_exempt_a_redefined_baton() {
+    let s = guard_setup();
+    let ws = &s.ws;
+    let board = ws.clone_dir();
+    assert_eq!(bash(ws, "baton inbox", &board), None);
+    for cmd in [
+        "PATH=/tmp/evil:$PATH baton inbox",
+        "PATH=/tmp/evil baton inbox",
+        "export PATH=/tmp/evil:$PATH; baton inbox",
+        "PATH=/tmp/evil; baton inbox",
+        "baton() { rm -rf messages; }; baton inbox",
+        "function baton { rm -rf messages; }; baton inbox",
+        "alias baton='rm -rf'; baton messages",
+        "source ./x.sh; baton inbox",
+        ". ./x.sh && baton inbox",
+        "hash -p /tmp/evil baton; baton inbox",
+        "env PATH=/tmp/evil baton inbox",
+        "declare -x PATH=/tmp/evil; baton inbox",
+    ] {
+        assert_eq!(decision(&bash(ws, cmd, &board)), Some("ask"), "{cmd}");
+    }
+}
+
+/// Known bypass shapes from every review finding: none may pass silently
+/// as a git write to the notes repo or any git in the board clone.
+#[test]
+fn guard_never_silently_allows_known_bypass_shapes() {
+    let s = guard_setup();
+    let ws = &s.ws;
+    let notes_sub = s.notes.join("sub");
+    std::fs::create_dir_all(&notes_sub).unwrap();
+    let link = s.repo.join("via-link");
+    std::os::unix::fs::symlink(&notes_sub, &link).unwrap();
+    let n = s.notes.to_str().unwrap().to_owned();
+    let b = ws.clone_dir().to_str().unwrap().to_owned();
+    let r = s.repo.to_str().unwrap().to_owned();
+    let l = link.to_str().unwrap().to_owned();
+    let shapes = [
+        // plain, chained, wrappers
+        "git -C {T} commit -m x",
+        "cd {T} && git add .",
+        "true; git -C {T} commit -am x",
+        "ls | git -C {T} fetch",
+        "sudo git -C {T} commit",
+        "env git -C {T} commit",
+        "command git -C {T} commit",
+        "timeout 5 git -C {T} push",
+        "nice -n 5 git -C {T} push",
+        "find {T} -name x -exec git -C {T} add {} +",
+        // 1: git dir and work tree
+        "git --git-dir={T}/.git --work-tree=/tmp commit",
+        "GIT_DIR={T}/.git git commit",
+        "GIT_DIR={T}/.git GIT_WORK_TREE={R} git add .",
+        "git --git-dir={R}/.git --work-tree={T} add .",
+        // 2, 3, 11: read-only commands made unsafe; aliases
+        "git -C {T} -c core.pager=evil log",
+        "git -C {T} -c alias.log=commit log",
+        "git -C {T} grep -O evil x",
+        "git -C {T} log --output=/tmp/x",
+        "git -C {T} diff --ext-diff",
+        "GIT_PAGER=evil git -C {T} log",
+        "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.pager GIT_CONFIG_VALUE_0=evil git -C {T} log",
+        "export GIT_EXTERNAL_DIFF=evil; git -C {T} diff",
+        "git -C {T} st",
+        // 4: substitutions and arithmetic
+        "echo $(git -C {T} commit)",
+        "echo `git -C {T} commit`",
+        "echo $( (git -C {T} commit) )",
+        "echo $((git -C {T} commit) )",
+        "echo $(( $(git -C {T} commit) + 1 ))",
+        // 5: shells and their input
+        "bash -c 'git -C {T} commit'",
+        "sh -lc \"cd {T} && git add .\"",
+        "bash <<EOF\ngit -C {T} commit\nEOF",
+        "bash <<< 'git -C {T} commit'",
+        "echo 'git -C {T} commit' | bash",
+        "bash -s < x.sh",
+        "eval \"git -C {T} commit\"",
+        "eval \"$X\"",
+        "env -S 'git -C {T} commit'",
+        // 6: cd scoping and environment
+        "cd {T} || true; git commit",
+        "test -d x && cd {T}; git commit",
+        "if true; then cd {T}; fi; git commit",
+        "cd {T}; git commit",
+        "cd $X && git commit",
+        "export GIT_DIR=$X; git commit",
+        "GIT_DIR=$X git commit",
+        "source x.sh; git commit",
+        // 7: symlinks
+        "git -C {L}/.. commit",
+        "cd {L}/.. && git commit",
+        "env -C {L}/.. git commit",
+        // 10: exit never hides a later command
+        "exit 0; git -C {T} commit",
+        "f() { exit; }; git -C {T} commit",
+        "bash -c 'f(){ exit; }; git -C {T} commit'",
+        "true || exit; git -C {T} commit",
+        // unparseable or unknown programs
+        "git -C {T} commit -m \"open",
+        "$GIT -C {T} commit",
+        "git $SUB -C {T}",
+    ];
+    for target in [&n, &b] {
+        for shape in shapes {
+            // The symlink shapes only point at the notes repo.
+            if target == &b && shape.contains("{L}") {
+                continue;
+            }
+            let cmd = shape
+                .replace("{T}", target)
+                .replace("{R}", &r)
+                .replace("{L}", &l);
+            let d = decision(&bash(ws, &cmd, &s.repo)).map(str::to_owned);
+            assert!(
+                matches!(d.as_deref(), Some("ask" | "deny")),
+                "silent on: {cmd} -> {d:?}"
+            );
+        }
+    }
+    // 8, 12: only the real baton is exempt in the board clone.
+    for cmd in [
+        format!("PATH=/tmp/x baton {b}"),
+        format!("baton() {{ :; }}; baton {b}"),
+        format!("alias baton=rm; baton {b}"),
+        format!("{n}/baton {b}"),
+    ] {
+        let d = decision(&bash(ws, &cmd, &s.repo)).map(str::to_owned);
+        assert!(
+            matches!(d.as_deref(), Some("ask" | "deny")),
+            "silent on: {cmd}"
+        );
+    }
+}
