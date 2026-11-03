@@ -19,8 +19,8 @@ use crate::config::Config;
 use crate::error::{Kind, Result};
 use crate::git::Git;
 use crate::hooks::{
-    Arming, GitCall, Invocation, Loc, NOTES_READ_ONLY, canonical, hook_keys, invocations, locate,
-    parse_push, path_under, sessions_dir, write_atomic,
+    Arming, GIT_BUILTINS, GitCall, Invocation, Loc, NOTES_READ_ONLY, Spec, hook_keys, invocations,
+    locate, parse_push, path_under, sessions_dir, unsafe_read_arg, write_atomic,
 };
 use crate::output::field;
 use crate::record::MsgKind;
@@ -477,17 +477,18 @@ fn bash(cmd: &str, cwd: &Path, ctx: &mut GuardCtx, d: &mut Decision) {
     for inv in invs {
         match inv {
             Invocation::Opaque(text) => {
-                if text.contains("git") {
-                    d.ask("runs shell text that baton cannot read; it may run git");
+                if text.to_ascii_lowercase().contains("git") {
+                    d.ask("runs a program named by a variable; it may run git");
                 }
             }
+            Invocation::Unknown(why) => d.ask(why),
             Invocation::Other { dir, words } => {
                 let Some(board) = ctx.board.clone() else {
                     continue;
                 };
                 if words
                     .first()
-                    .is_some_and(|w| w.text.rsplit('/').next() == Some("baton"))
+                    .is_some_and(|w| is_real_baton(w, dir.as_deref()))
                 {
                     continue;
                 }
@@ -501,9 +502,41 @@ fn bash(cmd: &str, cwd: &Path, ctx: &mut GuardCtx, d: &mut Decision) {
                     d.ask("this command touches the board clone, which only baton should change");
                 }
             }
-            Invocation::Git(g) => git(&g, ctx, d),
+            Invocation::Git(g) => git(&g, ctx, d, 0),
         }
     }
+}
+
+/// Is `w` (a program word run from `dir`) this baton binary? A bare name
+/// is looked up in `PATH`; a path is resolved. Anything else named `baton`
+/// is just another program.
+fn is_real_baton(w: &crate::hooks::Word, dir: Option<&Path>) -> bool {
+    if w.dynamic || w.text.rsplit('/').next() != Some("baton") {
+        return false;
+    }
+    let Some(me) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.canonicalize().ok())
+    else {
+        return false;
+    };
+    let found = if w.text.contains('/') {
+        let p = PathBuf::from(&w.text);
+        let p = if p.is_absolute() {
+            Some(p)
+        } else {
+            dir.map(|d| d.join(p))
+        };
+        p.and_then(|p| p.canonicalize().ok())
+    } else {
+        std::env::var_os("PATH").and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|d| d.join(&w.text))
+                .find(|c| c.is_file())
+                .and_then(|c| c.canonicalize().ok())
+        })
+    };
+    found.is_some_and(|f| f == me)
 }
 
 fn path_word_under(text: &str, dir: Option<&Path>, root: &Path) -> bool {
@@ -516,52 +549,166 @@ fn path_word_under(text: &str, dir: Option<&Path>, root: &Path) -> bool {
         PathBuf::from(text)
     };
     if p.is_absolute() {
-        return canonical(&p).starts_with(canonical(root));
+        return path_under(&p, Path::new("/"), root);
     }
-    dir.is_some_and(|d| canonical(&d.join(p)).starts_with(canonical(root)))
+    dir.is_some_and(|d| path_under(&d.join(p), Path::new("/"), root))
 }
 
-fn git(g: &GitCall, ctx: &mut GuardCtx, d: &mut Decision) {
-    let sub = g.sub.as_deref();
-    let read_only = match sub {
-        Some(s) => NOTES_READ_ONLY.contains(&s),
-        None => !g.sub_unknown,
+/// Read-only in the notes repo: a listed subcommand, no options that run
+/// programs or write files, nothing unreadable.
+fn notes_read_only(g: &GitCall) -> Option<bool> {
+    let sub = match (&g.sub, g.sub_unknown) {
+        (_, true) => return None,
+        (None, false) => return Some(true),
+        (Some(s), false) => s.as_str(),
     };
-    let loc = g
-        .dir
-        .as_deref()
-        .map(|dir| locate(dir, ctx.board.as_deref(), ctx.notes.as_deref()));
-    match loc {
-        Some(Loc::Board) => {
-            if g.embedded {
-                d.ask(BOARD_WHY);
-            } else {
-                d.deny(BOARD_WHY);
-            }
+    if !NOTES_READ_ONLY.contains(&sub) {
+        return Some(false);
+    }
+    if !g.configs.is_empty() || g.risky_globals || g.args.iter().any(|a| unsafe_read_arg(sub, a)) {
+        return None;
+    }
+    Some(true)
+}
+
+const MAX_ALIAS_DEPTH: usize = 5;
+
+fn git(g: &GitCall, ctx: &mut GuardCtx, d: &mut Decision, depth: usize) {
+    let (board, notes) = (ctx.board.clone(), ctx.notes.clone());
+    let loc = |p: &Path| locate(p, board.as_deref(), notes.as_deref());
+    // The repository is the git dir when one is given, else the directory.
+    let repo = match &g.git_dir {
+        Spec::Known(p) => Some(loc(p)),
+        Spec::Unknown => None,
+        Spec::Unset => g.dir.as_deref().map(loc),
+    };
+    let tree = match &g.work_tree {
+        Spec::Known(p) => Some(Some(loc(p))),
+        Spec::Unknown => Some(None),
+        Spec::Unset => None,
+    };
+    match (&repo, &tree) {
+        (Some(r), Some(Some(t))) if r.kind() != t.kind() => {
+            d.ask("the git dir and the work tree are in different places")
         }
-        Some(Loc::Notes) => {
-            if !read_only {
-                let why = format!(
+        (_, Some(None)) => d.ask("cannot tell which work tree this git command uses"),
+        _ => {}
+    }
+    // A work tree inside the board or notes repo is treated like that repo.
+    let repo = match (repo, tree) {
+        (Some(Loc::Other(_)), Some(Some(t @ (Loc::Board | Loc::Notes)))) => Some(t),
+        (r, _) => r,
+    };
+    let read_only = notes_read_only(g);
+    let refuse = |d: &mut Decision, why: String| {
+        if g.embedded {
+            d.ask(why);
+        } else {
+            d.deny(why);
+        }
+    };
+    match repo {
+        Some(Loc::Board) => refuse(d, BOARD_WHY.to_owned()),
+        Some(Loc::Notes) => match read_only {
+            Some(true) => {}
+            None => d.ask(
+                "a read-only git command in the notes repo with options that can run programs or write files",
+            ),
+            Some(false) => refuse(
+                d,
+                format!(
                     "in the notes repo, commit and push with `baton sync --paths <files>`; only read-only git ({}) runs here",
                     NOTES_READ_ONLY.join(", ")
-                );
-                if g.embedded {
-                    d.ask(why);
-                } else {
-                    d.deny(why);
-                }
-            }
-        }
+                ),
+            ),
+        },
         None => {
-            if !read_only {
+            if read_only != Some(true) {
                 d.ask("cannot tell which repository this git command runs in");
             }
         }
-        Some(Loc::Other(top)) => {
-            if g.sub_unknown {
-                d.ask("the git subcommand is a variable");
-            } else if sub == Some("push") {
-                push(g, top.as_deref(), ctx, d);
+        Some(Loc::Other(top)) => other_repo(g, top.as_deref(), ctx, d, depth),
+    }
+}
+
+/// Git in a repository that is neither the board nor the notes repo:
+/// only pushes (and what may hide one) need the human.
+fn other_repo(g: &GitCall, top: Option<&Path>, ctx: &mut GuardCtx, d: &mut Decision, depth: usize) {
+    if g.sub_unknown {
+        d.ask("the git subcommand cannot be read");
+        return;
+    }
+    if g.risky_globals {
+        d.ask("git options that can change what the command runs (--config-env, --exec-path, or unknown)");
+    }
+    if g.configs.iter().any(|k| k.starts_with("alias.")) {
+        d.ask("`-c alias.*` can redefine the command");
+    }
+    let Some(sub) = g.sub.as_deref() else {
+        return;
+    };
+    match sub {
+        "push" => {
+            if g.configs.iter().any(|k| {
+                ["remote.", "push.", "branch.", "url."]
+                    .iter()
+                    .any(|p| k.starts_with(p))
+            }) {
+                d.ask("`-c` overrides where or what the push sends");
+            }
+            if g.git_dir != Spec::Unset || g.work_tree != Spec::Unset {
+                d.ask("a push with an explicit git dir or work tree");
+            }
+            push(g, top, ctx, d);
+        }
+        "send-pack" => d.ask("git send-pack pushes refs"),
+        s if GIT_BUILTINS.contains(&s) => {}
+        s => {
+            // An alias, or an external `git-<s>` program.
+            let Some(dir) = g.dir.as_deref() else {
+                d.ask(format!("cannot look up git command {}", field(s)));
+                return;
+            };
+            let alias = Git::new(dir)
+                .output(["config", "--get", &format!("alias.{s}")])
+                .ok()
+                .filter(|o| o.ok())
+                .map(|o| o.line());
+            match alias {
+                None => d.ask(format!(
+                    "`git {}` is not a built-in git command (an external program may push)",
+                    field(s)
+                )),
+                Some(a) if a.starts_with('!') => {
+                    d.ask(format!("git alias {} runs a shell command", field(s)))
+                }
+                Some(_) if depth >= MAX_ALIAS_DEPTH => d.ask("git aliases nest too deeply"),
+                Some(a) => match crate::hooks::parse_shell(&a) {
+                    Ok(items) => match items.as_slice() {
+                        [
+                            crate::hooks::Item {
+                                node: crate::hooks::Node::Cmd(c),
+                                ..
+                            },
+                        ] if !c.words.is_empty() && c.subs.is_empty() => {
+                            let mut words = c.words.clone();
+                            words.extend(g.args.iter().cloned());
+                            let mut expanded = crate::hooks::parse_git(
+                                &words,
+                                g.dir.clone(),
+                                g.git_dir.clone(),
+                                g.work_tree.clone(),
+                                false,
+                                g.embedded,
+                            );
+                            expanded.configs.extend(g.configs.iter().cloned());
+                            expanded.risky_globals |= g.risky_globals;
+                            other_repo(&expanded, top, ctx, d, depth + 1);
+                        }
+                        _ => d.ask(format!("git alias {} cannot be read", field(s))),
+                    },
+                    Err(_) => d.ask(format!("git alias {} cannot be read", field(s))),
+                },
             }
         }
     }
