@@ -319,23 +319,7 @@ impl State {
     fn check_status(&self, e: &StatusEvent, commit: &[&Record]) -> Result<()> {
         let ms = self.msgs.get(&e.msg).ok_or_else(|| unknown(&e.msg))?;
         let human = self.is_human(&e.by);
-        let (cur, new) = (ms.status, e.status);
-        let allowed = match cur {
-            Status::Open => matches!(new, Status::Working | Status::Done | Status::Wontdo),
-            Status::Working => matches!(new, Status::Done | Status::Wontdo | Status::Open),
-            Status::Done | Status::Wontdo => false,
-        };
-        if !allowed {
-            let hint = if cur.is_closed() {
-                "; nothing follows done or wontdo (reply to it instead)"
-            } else {
-                ""
-            };
-            return Err(rule(
-                "transition",
-                format!("{} is {cur}; it cannot become {new}{hint}", e.msg),
-            ));
-        }
+        let new = e.status;
         if !human && new.is_closed() && ms.msg.to == self.human {
             return Err(rule(
                 "human-message",
@@ -362,6 +346,23 @@ impl State {
                 });
             }
             _ => {}
+        }
+        let cur = ms.status;
+        let allowed = match cur {
+            Status::Open => matches!(new, Status::Working | Status::Done | Status::Wontdo),
+            Status::Working => matches!(new, Status::Done | Status::Wontdo | Status::Open),
+            Status::Done | Status::Wontdo => false,
+        };
+        if !allowed {
+            let hint = if cur.is_closed() {
+                "; nothing follows done or wontdo (reply to it instead)"
+            } else {
+                ""
+            };
+            return Err(rule(
+                "transition",
+                format!("{} is {cur}; it cannot become {new}{hint}", e.msg),
+            ));
         }
         if new == Status::Wontdo {
             let replied = commit

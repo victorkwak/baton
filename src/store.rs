@@ -78,7 +78,9 @@ impl Store {
     /// Open the board clone, cloning it when missing, and check that its
     /// `origin` is the configured board.
     pub fn open(config: &Config, session: &str) -> Result<Store> {
-        let path = config.board_clone()?;
+        // Absolute: git runs with `-C`, so a relative path (e.g. a temporary
+        // index under `.git`) would resolve twice.
+        let path = std::path::absolute(config.board_clone()?)?;
         if !path.join(".git").exists() {
             clone(&config.board, &path)?;
         }
@@ -368,33 +370,44 @@ impl Store {
             Some(p) => git.run(["read-tree", p])?,
             None => git.run(["read-tree", "--empty"])?,
         };
-        let mut added = 0;
-        for (path, bytes) in files {
+        // Blobs first (one hash-object per file), then one ls-files and one
+        // update-index for the whole commit: few calls keep the window
+        // between fetch and push short.
+        let mut blobs = Vec::with_capacity(files.len());
+        for (_, bytes) in files {
             let blob = git.output_with_input(["hash-object", "-w", "--stdin"], Some(bytes))?;
             if !blob.ok() {
                 return Err(classify("hash-object", &blob.stderr));
             }
-            let blob = blob.line();
-            let existing = git.run(["ls-files", "--stage", "--", path])?.line();
-            if !existing.is_empty() {
-                if existing.split_whitespace().nth(1) == Some(blob.as_str()) {
-                    continue;
-                }
-                crate::fail!(
+            blobs.push(blob.line());
+        }
+        let mut args = vec!["ls-files".to_owned(), "--stage".to_owned(), "--".to_owned()];
+        args.extend(files.iter().map(|(p, _)| p.clone()));
+        let existing = git.run(&args)?.stdout_str();
+        let mut info = String::new();
+        for ((path, _), blob) in files.iter().zip(&blobs) {
+            // `<mode> <blob> <stage>\t<path>`
+            let have = existing
+                .lines()
+                .find(|l| l.split_once('\t').is_some_and(|(_, p)| p == path));
+            match have {
+                Some(l) if l.split_whitespace().nth(1) == Some(blob.as_str()) => continue,
+                Some(_) => crate::fail!(
                     Rule,
                     "rule append-only: {path} already exists on the board with other content"
-                );
+                ),
+                None => info.push_str(&format!("100644 {blob}\t{path}\n")),
             }
-            git.run([
-                "update-index",
-                "--add",
-                "--cacheinfo",
-                &format!("100644,{blob},{path}"),
-            ])?;
-            added += 1;
         }
-        if added == 0 {
+        if info.is_empty() {
             return Ok(parent.map(str::to_owned));
+        }
+        let out = git.output_with_input(
+            ["update-index", "--add", "--index-info"],
+            Some(info.as_bytes()),
+        )?;
+        if !out.ok() {
+            return Err(classify("update-index --index-info", &out.stderr));
         }
         let tree = git.run(["write-tree"])?.line();
         let mut args = vec!["commit-tree".to_owned(), tree];
@@ -469,40 +482,58 @@ impl Store {
     where
         F: FnMut(&State) -> Result<Vec<Record>>,
     {
+        // Set by the first full attempt when the commit holds plain
+        // messages only and nothing was queued: their one rule (`reply_to`
+        // exists) cannot stop holding, so a retry only rebuilds the commit
+        // on the new tip. Rule-bearing commits re-read and re-check.
+        let mut plain: Option<Vec<Record>> = None;
         for attempt in 0..=RETRIES {
             let online = match self.fetch() {
                 Ok(()) => true,
                 Err(e) if e.kind == Kind::Offline => false,
                 Err(e) => return Err(e),
             };
-            let snap = self.read()?;
-            let mut records = build(&snap.state)?;
-            records.sort_by(|a, b| a.id().cmp(b.id()));
-            let rule_bearing = records.iter().any(Record::rule_bearing);
-            if !online && rule_bearing {
-                return self.queue_offline(&records, rule_bearing, summary, "fetch");
-            }
-            snap.state.check_commit(&records)?;
-            if !online {
-                return self.queue_offline(&records, rule_bearing, summary, "fetch");
-            }
-            // Rebuild queued commits on the fetched tip, then add ours.
-            let mut tip = snap.origin.clone();
-            for q in &snap.queued_commits {
-                tip = self.commit_files(&q.files, tip.as_deref(), &q.message)?;
-            }
-            if !records.is_empty() {
-                tip = Some(self.commit(&records, tip.as_deref(), summary)?);
-            }
-            let Some(sha) = tip else {
-                return Err(Error::new(Kind::Internal, "nothing to write"));
+            let (records, sha) = match &plain {
+                Some(records) if online => {
+                    let origin = self.origin_tip()?;
+                    let sha = self.commit(records, origin.as_deref(), summary)?;
+                    (records.clone(), sha)
+                }
+                _ => {
+                    let snap = self.read()?;
+                    let mut records = build(&snap.state)?;
+                    records.sort_by(|a, b| a.id().cmp(b.id()));
+                    let rule_bearing = records.iter().any(Record::rule_bearing);
+                    if !online && rule_bearing {
+                        return self.queue_offline(&records, rule_bearing, summary, "fetch");
+                    }
+                    snap.state.check_commit(&records)?;
+                    if !online {
+                        return self.queue_offline(&records, rule_bearing, summary, "fetch");
+                    }
+                    // Rebuild queued commits on the fetched tip, then add ours.
+                    let mut tip = snap.origin.clone();
+                    for q in &snap.queued_commits {
+                        tip = self.commit_files(&q.files, tip.as_deref(), &q.message)?;
+                    }
+                    if !records.is_empty() {
+                        tip = Some(self.commit(&records, tip.as_deref(), summary)?);
+                    }
+                    let Some(sha) = tip else {
+                        return Err(Error::new(Kind::Internal, "nothing to write"));
+                    };
+                    if snap.origin.as_deref() == Some(sha.as_str()) {
+                        return Ok(Written {
+                            commit: sha,
+                            queued: false,
+                        });
+                    }
+                    if !rule_bearing && !records.is_empty() && snap.queued_commits.is_empty() {
+                        plain = Some(records.clone());
+                    }
+                    (records, sha)
+                }
             };
-            if snap.origin.as_deref() == Some(sha.as_str()) {
-                return Ok(Written {
-                    commit: sha,
-                    queued: false,
-                });
-            }
             match self.push(&sha) {
                 Ok(Push::Pushed) => {
                     self.git.run(["update-ref", MAIN, &sha])?;
@@ -516,11 +547,17 @@ impl Store {
                     if attempt == RETRIES {
                         break;
                     }
-                    let base = 50u64 << attempt;
-                    let jitter = random_u64() % (100u64 << attempt);
-                    std::thread::sleep(Duration::from_millis(base + jitter));
+                    // Retry at once, with a few milliseconds of jitter: the
+                    // winner has just pushed and needs a whole write to push
+                    // again, so a quick retry lands. Measured with two
+                    // machines posting in tight loops: a 50-150 ms backoff
+                    // lost 4 races in a row on ~5% of posts (the busy writer
+                    // starves the sleeper); this jitter lost none in 600.
+                    let jitter = random_u64() % (2u64 << attempt);
+                    std::thread::sleep(Duration::from_millis(jitter));
                 }
                 Err(e) if e.kind == Kind::Offline => {
+                    let rule_bearing = records.iter().any(Record::rule_bearing);
                     return self.queue_offline(&records, rule_bearing, summary, "push");
                 }
                 Err(e) => return Err(e),
