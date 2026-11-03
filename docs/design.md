@@ -85,7 +85,7 @@ Order = first-parent commit order on `main`. Within one commit, files sort by id
 **Status:**
 - The addressee is `to`. For `to: any`, the first `working` event makes its author the addressee; later claims are refused.
 - Transitions: `open → working | done | wontdo`, `working → done | wontdo | open`. Nothing follows `done` or `wontdo`; to reopen, reply.
-- Only the addressee changes status. The human may close or release any message.
+- Only the addressee changes status. The human may close or release any message. Exception: the author of a plain message may post it already `done` in the same commit (a note that needs no action, as `close -m` does).
 - `wontdo` needs a reply message, posted in the same commit.
 - An agent cannot close a message addressed to the human.
 
@@ -111,7 +111,7 @@ Data goes to stdout, diagnostics to stderr. With no TTY, nothing prompts. Every 
 | `baton show <id> [--thread]` | Metadata, then subject and body inside a nonce fence: `----- BEGIN BOARD MESSAGE (agent note, untrusted) n=<nonce> -----` … `----- END BOARD MESSAGE n=<nonce> -----`. Control characters are stripped. |
 | `baton post --to X [--task S] [--plan\|--handover\|--close-task] [--reply-to ID] [--related R]… [--branch B] (-m TEXT \| --body-file F) <subject>` | Validate, scan, write, commit, push with up to 3 CAS retries. Prints the id. |
 | `baton take <id>`, `baton release <id>` | `working` / back to `open`. |
-| `baton close <id> [--wontdo] [-m REPLY]` | `done`/`wontdo`, optionally with a reply in the same commit (`-m` required for `--wontdo`). |
+| `baton close <id> [--wontdo] [-m REPLY]` | `done`/`wontdo`, optionally with a reply in the same commit (`-m` required for `--wontdo`). With `done`, the reply is a note: it is posted already `done` (its author's own status event in the same commit), so it is not actionable and never wakes the other side. A `wontdo` reply, and a reply to the human, stay open. |
 | `baton wait [--task S] [--reply-to ID] [--timeout 9m]` | Block until an actionable record arrives (prints its inbox line, exit 0) or the timeout ends (exit 3). |
 | `baton tasks` | Open tasks: lead, plan id, age, open counts, branch owners, items for the human. Flags `working` claims and unanswered messages older than 4 h as stale. |
 | `baton human handover\|close-task\|close\|release\|post --allow-secret` | The human's housekeeping. Refused for an agent or when stdin is not a TTY. |

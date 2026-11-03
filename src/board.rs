@@ -331,8 +331,16 @@ impl State {
         }
         // The human may close or release any message, but claims only its own.
         let human_override = human && new != Status::Working;
+        // A note that needs no action: its author posts it already `done`,
+        // in the same commit (`close -m`'s reply).
+        let own_note = new == Status::Done
+            && ms.msg.kind == MsgKind::Plain
+            && e.by == ms.msg.from
+            && commit
+                .iter()
+                .any(|r| matches!(r, Record::Message(m) if m.id == e.msg));
         match ms.addressee() {
-            Some(a) if a != e.by && !human_override => {
+            Some(a) if a != e.by && !human_override && !own_note => {
                 return Err(if ms.msg.to == "any" {
                     rule(
                         "claim",

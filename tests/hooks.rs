@@ -383,6 +383,67 @@ fn a_reply_to_an_armed_message_without_a_task_wakes() {
     );
 }
 
+#[test]
+fn closing_with_a_note_never_wakes_the_other_side() {
+    let (_net, ws, laptop) = pair();
+    let gap = [("BATON_WAKE_GAP_SECS", "0")];
+    let plan = as_session(
+        &ws,
+        &[
+            "post", "--to", "laptop", "--task", "t", "--plan", "-m", "p", "plan",
+        ],
+        None,
+        "ws-s",
+    );
+    as_session(&laptop, &["take", &plan], None, "lap-s");
+    let mut ws_w = spawn_waiter(&ws, "ws-s", None, &gap);
+    let lap_w = spawn_waiter(&laptop, "lap-s", None, &gap);
+
+    // Round 1: ws asks; laptop wakes.
+    let req = as_session(
+        &ws,
+        &["post", "--to", "laptop", "--task", "t", "-m", "x", "do it"],
+        None,
+        "ws-s",
+    );
+    let run = finish(lap_w, Duration::from_secs(15));
+    assert_eq!(woken_ids(&run.stderr), vec![req.clone()], "{run:?}");
+
+    // Round 2: laptop closes it with a note. ws stays asleep, and the note
+    // is not in ws's inbox.
+    let lap_w = spawn_waiter(&laptop, "lap-s", None, &gap);
+    as_session(
+        &laptop,
+        &["close", &req, "-m", "done, sha abc"],
+        None,
+        "lap-s",
+    );
+    still_running(&mut ws_w, Duration::from_millis(3000));
+    assert!(ws.inbox_ids(false).is_empty());
+
+    // Round 3: laptop asks back; ws wakes for that only, and closes it
+    // with a note, which does not wake laptop either.
+    let q = as_session(
+        &laptop,
+        &["post", "--to", "ws", "--task", "t", "-m", "?", "question"],
+        None,
+        "lap-s",
+    );
+    let run = finish(ws_w, Duration::from_secs(15));
+    assert_eq!(woken_ids(&run.stderr), vec![q.clone()], "{run:?}");
+    let mut lap_w = lap_w;
+    as_session(&ws, &["close", &q, "-m", "answered"], None, "ws-s");
+    still_running(&mut lap_w, Duration::from_millis(3000));
+    let next = as_session(
+        &ws,
+        &["post", "--to", "laptop", "--task", "t", "-m", "x", "next"],
+        None,
+        "ws-s",
+    );
+    let run = finish(lap_w, Duration::from_secs(15));
+    assert_eq!(woken_ids(&run.stderr), vec![next], "{run:?}");
+}
+
 // ---------------------------------------------------------------------------
 // guard
 

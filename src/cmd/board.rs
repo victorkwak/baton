@@ -476,6 +476,12 @@ fn close_with(format: Format, c: &Ctx, args: CloseArgs) -> Result<()> {
     let _lock = c.store.lock()?;
     let ev = status_event(&c.who, &id, status);
     let reply_id = new_id();
+    // With `done`, the reply is a note, not a request: it is posted already
+    // `done`, so it never wakes the other side (no ping-pong of closing
+    // notes). A `wontdo` reply stays open: the sender must decide what to
+    // do with refused work. A reply to the human stays open: only the
+    // human closes those.
+    let reply_done = status_event(&c.who, &reply_id, Status::Done);
     let at = now();
     let w = c
         .store
@@ -500,7 +506,11 @@ fn close_with(format: Format, c: &Ctx, args: CloseArgs) -> Result<()> {
                     body: text.clone(),
                 };
                 reply.validate()?;
+                let to_human = reply.to == c.config.human;
                 recs.push(Record::Message(reply));
+                if status == Status::Done && !to_human {
+                    recs.push(reply_done.clone());
+                }
             }
             Ok(recs)
         })?;
