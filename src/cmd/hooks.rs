@@ -234,8 +234,8 @@ fn wait() -> Result<()> {
     let total = env_secs("BATON_HOOK_TIMEOUT_SECS", 3600);
     let margin = env_secs("BATON_HOOK_MARGIN_SECS", 60);
     let deadline = start + total.saturating_sub(margin);
-    let active_window = env_secs("BATON_ACTIVE_SECS", 600);
-    let idle_poll = env_secs("BATON_IDLE_POLL_SECS", 300).max(Duration::from_secs(1));
+    // Longest wait between polls while git keeps failing.
+    let max_backoff = env_secs("BATON_MAX_BACKOFF_SECS", 300).max(Duration::from_secs(1));
     let gap = env_secs("BATON_WAKE_GAP_SECS", 120).as_secs() as i64;
 
     let input = read_input().unwrap_or_default();
@@ -300,7 +300,7 @@ fn wait() -> Result<()> {
         if failures == 0 {
             poll
         } else {
-            (poll * 2u32.pow(failures.min(5))).min(poll.max(idle_poll))
+            (poll * 2u32.pow(failures.min(5))).min(poll.max(max_backoff))
         }
     };
 
@@ -411,14 +411,7 @@ fn wait() -> Result<()> {
         let known = snap.origin.clone();
         let due = retry_in.map(|d| Instant::now() + d);
         loop {
-            // Active: the latest `Stop` (this waiter's start: a later one
-            // replaces this waiter) was less than `active_window` ago.
-            let poll = if start.elapsed() < active_window {
-                poll_interval()
-            } else {
-                idle_poll
-            };
-            let mut until = (Instant::now() + backoff(failures, poll)).min(deadline);
+            let mut until = (Instant::now() + backoff(failures, poll_interval())).min(deadline);
             if let Some(d) = due {
                 until = until.min(d);
             }

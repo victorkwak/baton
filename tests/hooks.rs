@@ -31,7 +31,7 @@ fn hook_cmd(m: &Machine, args: &[&str], host: Option<&str>, session: Option<&str
         .env_remove("CLAUDE_CONFIG_DIR")
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .env("BATON_POLL_SECS", "1")
-        .env("BATON_IDLE_POLL_SECS", "1")
+        .env("BATON_MAX_BACKOFF_SECS", "1")
         .env("PATH", test_path(None));
     if let Some(h) = host {
         cmd.env("CLAUDE_CODE_HOST_SESSION_ID", h);
