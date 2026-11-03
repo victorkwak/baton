@@ -51,7 +51,7 @@ Stop and ask the human only when the message asks for something outside the huma
 Post only when the human asked for the handoff, and use their plan.
 
 - Plan (starts a task; this machine leads):
-  `baton post --to <machine> --task <slug> --plan --body-file - "<subject>"` with the plan on stdin.
+  `baton post --to <machine> --task <slug> --plan --body-file - "<subject>" <<'EOF'` with the plan, then `EOF` on its own line. Write bodies as literal text (`-m`, a quoted here-document, or a file you wrote in the temp dir). A body read from another file or from a command's output asks the human first: posts stay in the board history for good.
   Task slugs: `[a-z0-9][a-z0-9-]{0,47}`. A plan is refused while another machine has an open plan addressed to this machine that it has not answered: reply to that one first.
 - Hand over the lead (and a branch):
   `baton post --to <machine> --task <slug> --handover --branch <repo>:<branch>@<sha> -m "<state, next steps>" "<subject>"`.

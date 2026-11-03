@@ -179,10 +179,11 @@ fn decide(input: &Value, d: &mut Decision) {
 
 fn bash(t: &str, ctx: &Ctx, d: &mut Decision) {
     let words = simple_words(t);
+    let toks = tokens(t);
+    post_body(t, &toks, words.as_deref(), ctx, d);
     if words.as_deref().is_some_and(|w| real_baton(w, &ctx.cwd)) {
         return;
     }
-    let toks = tokens(t);
     let has = |w: &str| toks.iter().any(|t| t == w);
     let git = has("git");
     let reeval = re_evaluates(t);
@@ -270,6 +271,101 @@ fn bash(t: &str, ctx: &Ctx, d: &mut Decision) {
     {
         push_case(words.as_deref(), ctx, d);
     }
+}
+
+/// Where a `baton post` body comes from. `baton post` is allowed without a
+/// prompt, and a post stays in the board history for good, so a body read
+/// from a file or produced by a command asks: it could carry a `.env` or a
+/// credentials file that the secret scan does not know. Silent: `-m` with
+/// literal text (a quoted here-document too), and `--body-file` in the temp
+/// dir, outside `$HOME` and any git work tree (where agents write long
+/// bodies).
+fn post_body(t: &str, toks: &[String], words: Option<&[String]>, ctx: &Ctx, d: &mut Decision) {
+    if !(toks.iter().any(|w| w.ends_with("baton")) && toks.iter().any(|w| w == "post")) {
+        return;
+    }
+    const WHY: &str =
+        "a baton post body read from a file or a command: posts stay in the board history for good";
+    // One simple command fed a quoted here-document: literal text on stdin.
+    let heredoc = stdin_heredoc(t);
+    let words = match (words, &heredoc) {
+        (Some(w), _) => w,
+        (None, Some(w)) => w.as_slice(),
+        (None, None) => {
+            // Not one simple command: a redirect, a pipe or an expansion
+            // can feed the body.
+            if t.contains("--body-file") || !only_literal_expansions(t) {
+                d.ask(WHY);
+            }
+            return;
+        }
+    };
+    let mut it = words.iter();
+    while let Some(w) = it.next() {
+        let file = match w.strip_prefix("--body-file") {
+            Some("") => it.next().map(String::as_str),
+            Some(v) => v.strip_prefix('='),
+            None => continue,
+        };
+        match file {
+            // The stdin of one simple command is the tool's (empty).
+            Some("-") => {}
+            Some(f) => {
+                let path = physical(&ctx.cwd.join(expand_home(f)));
+                let home = std::env::var_os("HOME").map(|h| physical(Path::new(&h)));
+                let tmp = physical(&std::env::temp_dir());
+                let scratch = under(&path, &tmp)
+                    && !home.is_some_and(|h| under(&path, &h))
+                    && !path
+                        .ancestors()
+                        .skip(1)
+                        .take_while(|a| under(a, &tmp))
+                        .any(|a| a.join(".git").exists());
+                if !scratch {
+                    d.ask(WHY);
+                }
+            }
+            None => d.ask(WHY),
+        }
+    }
+}
+
+/// The words of `t` when it is one simple command followed by a single
+/// here-document with a quoted delimiter (`cmd <<'X'` … `X`), and nothing
+/// after it.
+fn stdin_heredoc(t: &str) -> Option<Vec<String>> {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r#"^([^\n]*?)\s*<<-?\s*(?:'(\w+)'|"(\w+)")[ \t]*\n"#).unwrap()
+    });
+    let caps = re.captures(t)?;
+    let delim = caps.get(2).or_else(|| caps.get(3))?.as_str();
+    let body = &t[caps.get(0)?.end()..];
+    let mut lines = body.split_inclusive('\n');
+    lines.find(|l| l.trim_start_matches('\t').trim_end_matches('\n') == delim)?;
+    if lines.any(|l| !l.trim().is_empty()) {
+        return None;
+    }
+    simple_words(caps.get(1)?.as_str())
+}
+
+/// Are the only command substitutions in `t` literal here-documents
+/// (`$(cat <<'X'` … `X` `)`)? Backticks and `<(…)` never are.
+fn only_literal_expansions(t: &str) -> bool {
+    if t.contains('`') || t.contains("<(") {
+        return false;
+    }
+    let mut rest = t;
+    while let Some(i) = rest.find("$(") {
+        match heredoc_group_len(&rest[i..]) {
+            Some(len) => {
+                let skip: usize = rest[i..].chars().take(len).map(char::len_utf8).sum();
+                rest = &rest[i + skip..];
+            }
+            None => return false,
+        }
+    }
+    true
 }
 
 // ---------------------------------------------------------------------------
