@@ -240,7 +240,7 @@ fn wait_finds_a_message_that_arrived_between_waiters() {
 }
 
 #[test]
-fn wait_exits_at_once_when_unarmed_or_already_waiting() {
+fn wait_exits_at_once_when_unarmed() {
     let (_net, ws, laptop) = pair();
     // Unarmed: nothing posted, taken or replied by this session.
     laptop.post("ws", "plan", &["--task", "t", "--plan"]);
@@ -251,17 +251,49 @@ fn wait_exits_at_once_when_unarmed_or_already_waiting() {
     );
     assert_eq!(run.code, 0, "{run:?}");
     assert!(start.elapsed() < Duration::from_secs(5));
+}
 
-    // A second waiter for the same session exits 0 while the first waits.
-    let plan = ws.inbox_ids(false);
-    as_session(&ws, &["take", &plan[0]], None, "s");
-    let mut first = spawn_waiter(&ws, "s", None, &[]);
-    still_running(&mut first, Duration::from_millis(1000));
-    let run = finish(spawn_waiter(&ws, "s", None, &[]), Duration::from_secs(10));
+#[test]
+fn the_newest_waiter_takes_over_the_session() {
+    let (_net, ws, laptop) = pair();
+    let plan = laptop.post("ws", "plan", &["--task", "t", "--plan"]);
+    as_session(&ws, &["take", &plan], None, "s");
+    // First Stop: a waiter whose deadline comes in 5 s.
+    let short = [
+        ("BATON_HOOK_TIMEOUT_SECS", "6"),
+        ("BATON_HOOK_MARGIN_SECS", "1"),
+    ];
+    let first_started = Instant::now();
+    let mut first = spawn_waiter(&ws, "s", None, &short);
+    still_running(&mut first, Duration::from_millis(1500));
+
+    // Second Stop: the new waiter takes over; the first exits 0 promptly.
+    let second = spawn_waiter(
+        &ws,
+        "s",
+        None,
+        &[
+            ("BATON_HOOK_TIMEOUT_SECS", "30"),
+            ("BATON_HOOK_MARGIN_SECS", "1"),
+        ],
+    );
+    let yielded = Instant::now();
+    let run = finish(first, Duration::from_secs(10));
     assert_eq!(run.code, 0, "{run:?}");
-    still_running(&mut first, Duration::from_millis(100));
-    first.kill().unwrap();
-    let _ = first.wait();
+    assert_eq!(run.stderr, "");
+    assert!(
+        yielded.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        yielded.elapsed()
+    );
+
+    // A message after the first waiter's deadline still wakes the session.
+    let past = Duration::from_millis(5500).saturating_sub(first_started.elapsed());
+    std::thread::sleep(past);
+    let msg = laptop.post("ws", "late", &["--task", "t"]);
+    let run = finish(second, Duration::from_secs(15));
+    assert_eq!(run.code, 2, "{run:?}");
+    assert_eq!(woken_ids(&run.stderr), vec![msg]);
 }
 
 #[test]

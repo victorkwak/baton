@@ -23,7 +23,7 @@ use crate::hooks::{
     locate, parse_push, path_under, sessions_dir, unsafe_read_arg, write_atomic,
 };
 use crate::output::field;
-use crate::record::MsgKind;
+use crate::record::{MsgKind, random_u64};
 use crate::store::Store;
 
 #[derive(Debug, Subcommand)]
@@ -122,6 +122,61 @@ impl WaitState {
     }
 }
 
+/// The newest waiter of a session: `sessions/<key>.gen.json`, written by
+/// each waiter as it starts (each `Stop`). An older waiter that sees a
+/// newer generation exits 0; the newest takes over the session's lock.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Generation {
+    token: String,
+    /// Unix milliseconds at the `Stop` that started this waiter.
+    started: i64,
+}
+
+impl Generation {
+    fn path(dir: &Path, key: &str) -> PathBuf {
+        dir.join(format!("{key}.gen.json"))
+    }
+
+    fn new() -> Generation {
+        let started = jiff::Timestamp::now().as_millisecond();
+        Generation {
+            token: format!("{}-{started}-{:x}", std::process::id(), random_u64()),
+            started,
+        }
+    }
+
+    fn write(&self, dir: &Path, key: &str) -> Result<()> {
+        let text = serde_json::to_vec(self).map_err(anyhow::Error::from)?;
+        write_atomic(&Self::path(dir, key), &text)
+    }
+
+    /// Is `self` still the newest? An unreadable file counts as newest:
+    /// only a newer waiter's write ends an older one.
+    fn current(&self, dir: &Path, key: &str) -> bool {
+        std::fs::read_to_string(Self::path(dir, key))
+            .ok()
+            .and_then(|t| serde_json::from_str::<Generation>(&t).ok())
+            .is_none_or(|g| g.token == self.token)
+    }
+}
+
+/// How often a sleeping waiter checks that it is still the newest.
+const CHECK_EVERY: Duration = Duration::from_millis(250);
+
+/// Sleep until `until`, in short steps; `false` as soon as `keep` says stop.
+fn nap(until: Instant, keep: &dyn Fn() -> bool) -> bool {
+    loop {
+        let now = Instant::now();
+        if now >= until {
+            return keep();
+        }
+        if !keep() {
+            return false;
+        }
+        std::thread::sleep((until - now).min(CHECK_EVERY));
+    }
+}
+
 /// Does `m` wake a session armed with `arming`? Open, addressed to this
 /// machine (or an unclaimed `any`), not this machine's own, not a plan or
 /// `close-task`, and in an armed task (or a reply to an armed message),
@@ -164,8 +219,9 @@ fn unix_now() -> i64 {
 }
 
 /// The `Stop` waiter (`docs/design.md`, "The waiter"). Exits 0 when there
-/// is nothing to wait for, another waiter holds the session, or one minute
-/// before the hook's timeout; exits 2 with the wake line on stderr.
+/// is nothing to wait for, a newer waiter (a later `Stop`) took over the
+/// session, or one minute before the hook's timeout; exits 2 with the wake
+/// line on stderr.
 fn wait() -> Result<()> {
     let start = Instant::now();
     let total = env_secs("BATON_HOOK_TIMEOUT_SECS", 3600);
@@ -182,15 +238,28 @@ fn wait() -> Result<()> {
     };
     let dir = sessions_dir()?;
     std::fs::create_dir_all(&dir)?;
+    // This `Stop` is the newest: announce it, so an older waiter of the
+    // session exits, then take the session's lock from it.
+    let generation = Generation::new();
+    generation.write(&dir, &primary)?;
+    let newest = || generation.current(&dir, &primary);
     let lock = File::options()
         .create(true)
         .truncate(false)
         .write(true)
         .open(dir.join(format!("{primary}.lock")))?;
-    match lock.try_lock() {
-        Ok(()) => {}
-        Err(std::fs::TryLockError::WouldBlock) => return Ok(()),
-        Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+    loop {
+        match lock.try_lock() {
+            Ok(()) => break,
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+        }
+        if Instant::now() >= deadline || !nap(Instant::now() + CHECK_EVERY, &newest) {
+            return Ok(());
+        }
+    }
+    if !newest() {
+        return Ok(());
     }
     let armed = Arming::load_all(&keys)?;
     if armed.is_empty() {
@@ -244,6 +313,10 @@ fn wait() -> Result<()> {
             .messages_since(cursor)
             .filter(|m| wakes(m, &arming, &config.machine))
             .collect();
+        if !newest() {
+            // A newer waiter owns the session now; it finds the same records.
+            return Ok(());
+        }
         let now = unix_now();
         let mut retry_in: Option<Duration> = None;
         if found.is_empty() {
@@ -289,6 +362,8 @@ fn wait() -> Result<()> {
         let known = snap.origin.clone();
         let due = retry_in.map(|d| Instant::now() + d);
         loop {
+            // Active: the latest `Stop` (this waiter's start: a later one
+            // replaces this waiter) was less than `active_window` ago.
             let poll = if start.elapsed() < active_window {
                 poll_interval()
             } else {
@@ -298,8 +373,7 @@ fn wait() -> Result<()> {
             if let Some(d) = due {
                 until = until.min(d);
             }
-            std::thread::sleep(until.saturating_duration_since(Instant::now()));
-            if Instant::now() >= deadline {
+            if !nap(until, &newest) || Instant::now() >= deadline {
                 return Ok(());
             }
             if due.is_some_and(|d| Instant::now() >= d) {
