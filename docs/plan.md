@@ -81,10 +81,10 @@ If you need a change in a file you do not own (a new dependency, a helper in `gi
 
 ## Agent C: setup and hooks (after A is merged)
 
-1. **`hook session-start`, `hook wait`, `hook guard`**, as in `docs/design.md`, "Claude Code hooks". Hooks read JSON on stdin (`session_id`, `cwd`, `tool_name`, `tool_input`) and answer as Claude Code expects: `wait` exits 2 with the wake line on stderr; `guard` prints a JSON `hookSpecificOutput` with `permissionDecision` `allow`/`ask`/`deny` and a reason. Check the exact formats in the Claude Code hooks docs.
+1. **`hook wait`, `hook guard`** (no SessionStart hook: work is picked up only by `/baton`), as in `docs/design.md`, "Claude Code hooks". Hooks read JSON on stdin (`session_id`, `cwd`, `tool_name`, `tool_input`) and answer as Claude Code expects: `wait` exits 2 with the wake line on stderr; `guard` prints a JSON `hookSpecificOutput` with `permissionDecision` `allow`/`ask`/`deny` and a reason. Check the exact formats in the Claude Code hooks docs.
 2. **`init`**: write the config (refuse to overwrite), clone the board, print the settings JSON for the hooks and permissions, and the sweeper units (systemd user service + timer on Linux, LaunchAgent plist on macOS) as files to install, with the commands. It changes nothing outside `baton`'s own directories.
 3. **`doctor`:** report config, clone, remote reachability, SSH agent, hooks found in `~/.claude/settings.json`, stale locks and journals.
-4. **`plugin/`:** a Claude Code skill `board` (the command cheat-sheet, plan and reply templates).
+4. **`plugin/`:** the Claude Code skill `baton`, invoked as `/baton [id]`: it runs `baton inbox`, shows what waits for this machine, takes and shows the message on the human's go-ahead, then starts the work. It also has the command cheat-sheet and plan and reply templates for the lead side.
 5. **Tests:** feed hook JSON on stdin and check exit codes and output; `guard` decisions for each git case; `init` into temp directories; `wait` wakes on a new actionable message and not on events or the session's own records.
 
 ## Done means

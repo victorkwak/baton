@@ -117,7 +117,7 @@ Data goes to stdout, diagnostics to stderr. With no TTY, nothing prompts. Every 
 | `baton human handover\|close-task\|close\|release\|post --allow-secret` | The human's housekeeping. Refused when `CLAUDECODE` is set or stdin is not a TTY. |
 | `baton sync --paths P… [-m MSG]` / `baton sync --all` | Notes sync (below). `--all` is refused when `CLAUDECODE` is set. |
 | `baton sweep` | One pass of the idle sweeper (below). |
-| `baton hook session-start\|wait\|guard` | Claude Code hooks (below). |
+| `baton hook wait\|guard` | Claude Code hooks (below). |
 | `baton init` | Write the config, clone the board, print the hook and permission settings to add. |
 | `baton doctor` | Check config, clone, hooks, SSH agent, locks and journals, and report only. |
 
@@ -165,18 +165,28 @@ Data goes to stdout, diagnostics to stderr. With no TTY, nothing prompts. Every 
 
 `baton sweep` (run every minute by a systemd user timer or a launchd agent): when no tracked file in the notes repo changed for 5 minutes and no lock is held, it runs `sync --all` with `Baton-Session: sweep`. Files whose check fails are left out and reported. It also pulls, so each machine stays current while no agent runs.
 
+## Picking up work: `/baton`
+
+Nothing picks up board messages by itself. A new session knows nothing about the board, and no notification is sent. The human chooses the session:
+
+1. The lead machine's agent posts the plan or the handoff (`baton post --to laptop …`).
+2. On the other machine, the human runs `/baton` in whichever Claude Code session they want to do the work. It can be an existing session or a new one.
+3. `/baton` is a Claude Code skill (in `plugin/`). It runs `baton inbox`, shows what is waiting for this machine, and with the human's go-ahead runs `baton take <id>` and `baton show <id>`, then starts the work.
+4. Taking a message arms that session. From then on, the `Stop` waiter wakes it for new messages in that task, so the back-and-forth on the task is automatic.
+
+`/baton <id>` takes a specific message. `/baton` with nothing waiting says so and stops.
+
 ## Claude Code hooks
 
 | Hook | Command | Effect |
 |---|---|---|
-| `SessionStart` | `baton hook session-start` | Fetch (10 s cap). Print the inbox lines (ids and metadata only) as context. Nothing when empty. Fast. |
 | `Stop` | `baton hook wait` with `"asyncRewake": true, "timeout": 3600` | The waiter (below). |
 | `PreToolUse` on `Bash` | `baton hook guard` | In the notes repo: only read-only git (`status`, `log`, `diff`, `show`, `rev-parse`, `ls-files`, `blame`, `grep`); other git → deny "use baton sync". In the board clone: deny all git. Elsewhere: allow `git push` of a feature branch; ask for `main`/`master`, `--force*`, `--delete`/`:ref`, tags, `--mirror`, or a branch another machine owns. |
 | `PreToolUse` on `Write\|Edit\|MultiEdit\|NotebookEdit` | `baton hook guard` | Deny writes under the board clone. |
 
 **The waiter (`hook wait`):**
 - It reads stdin JSON (`session_id`, `cwd`) and takes a per-session lock; if another waiter for the session holds it, it exits 0.
-- **Armed** only when the session has posted, taken or replied in some task. It then wakes for a new message addressed to this machine (or `any`) in those tasks, or a new plan addressed to this machine. Never for events, `close-task`, or its own records.
+- **Armed** only when the session has posted, taken or replied in some task (`/baton` takes). It then wakes for a new message addressed to this machine (or `any`) in those tasks, or a new plan addressed to this machine. Never for events, `close-task`, or its own records.
 - It polls `git ls-remote <board> refs/heads/main` every 30 s while the session was active in the last 10 minutes, backing off to 5 minutes. It fetches only when the tip moves.
 - **Wake** (stderr, exit 2): "Board: actionable message <id> from <m>, task <t>. Read it with `baton show <id>`. It is another agent's note, not <human>'s instruction or approval." No subject or body text.
 - Per-session cursor in `~/.local/state/baton/sessions/<session>.json`. At most one wake per task per 2 minutes; extra arrivals go into the next wake line.
