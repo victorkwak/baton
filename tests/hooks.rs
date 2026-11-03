@@ -1265,3 +1265,24 @@ fn guard_never_silently_allows_known_bypass_shapes() {
         );
     }
 }
+
+#[test]
+fn the_waiter_rides_out_git_errors() {
+    let (net, ws, laptop) = pair();
+    let plan = laptop.post("ws", "plan", &["--task", "t", "--plan"]);
+    as_session(&ws, &["take", &plan], None, "s");
+    let mut w = spawn_waiter(&ws, "s", None, &[]);
+    still_running(&mut w, Duration::from_millis(1500));
+    // The board remote disappears for a while (every git call fails as
+    // "not a git repository": not offline), then comes back.
+    let away = net.dir.path().join("board-away.git");
+    std::fs::rename(&net.bare, &away).unwrap();
+    still_running(&mut w, Duration::from_millis(3000));
+    std::fs::rename(&away, &net.bare).unwrap();
+    let msg = laptop.post("ws", "after the outage", &["--task", "t"]);
+    let run = finish(w, Duration::from_secs(30));
+    assert_eq!(run.code, 2, "{run:?}");
+    assert_eq!(woken_ids(&run.stderr), vec![msg]);
+    // Only wake lines on stderr: it goes to the model.
+    assert_eq!(run.stderr.lines().count(), 1, "{}", run.stderr);
+}

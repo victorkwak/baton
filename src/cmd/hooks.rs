@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use crate::board::{MsgState, State};
 use crate::cmd::board::poll_interval;
 use crate::config::Config;
-use crate::error::{Kind, Result};
+use crate::error::Result;
 use crate::git::Git;
 use crate::hooks::{
     Arming, GIT_BUILTINS, GitCall, Invocation, Loc, NOTES_READ_ONLY, Spec, hook_keys, invocations,
@@ -86,6 +86,11 @@ struct WaitState {
     /// Wake key (task, or `reply:<id>`) → unix seconds of its last wake.
     #[serde(default)]
     last_wake: BTreeMap<String, i64>,
+    /// The last git error the waiter rode out (unix seconds, message).
+    /// Not on stderr: a later wake's stderr goes to the model, and it must
+    /// hold the wake lines only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_error: Option<(i64, String)>,
 }
 
 impl WaitState {
@@ -108,6 +113,9 @@ impl WaitState {
             for (task, t) in s.last_wake {
                 let e = all.last_wake.entry(task).or_insert(t);
                 *e = (*e).max(t);
+            }
+            if s.last_error.as_ref().map(|e| e.0) > all.last_error.as_ref().map(|e| e.0) {
+                all.last_error = s.last_error;
             }
         }
         all
@@ -274,7 +282,26 @@ fn wait() -> Result<()> {
     let config = Config::load()?;
     let store = Store::open(&config, &primary)?;
     let mut ws = WaitState::load(&dir, &keys);
+    // Fetch at the start of the next round (the tip moved, or a fetch failed).
     let mut fetch = false;
+    // Git errors in a row. Inside the waiter every git error (offline,
+    // auth, remote, timeout, internal) is transient: note it, back off,
+    // keep polling until the deadline.
+    let mut failures: u32 = 0;
+    let note = |ws: &mut WaitState, failures: &mut u32, e: &crate::error::Error| {
+        *failures = failures.saturating_add(1);
+        if ws.last_error.as_ref().is_none_or(|(_, m)| *m != e.message) {
+            ws.last_error = Some((unix_now(), e.message.clone()));
+            let _ = ws.save(&dir, &keys);
+        }
+    };
+    let backoff = |failures: u32, poll: Duration| {
+        if failures == 0 {
+            poll
+        } else {
+            (poll * 2u32.pow(failures.min(5))).min(poll.max(idle_poll))
+        }
+    };
 
     loop {
         let arming = Arming::load_all(&keys)?;
@@ -282,18 +309,32 @@ fn wait() -> Result<()> {
             let _l = store.lock()?;
             if fetch {
                 match store.fetch() {
-                    Ok(()) => {}
-                    Err(e) if e.kind == Kind::Offline => {}
-                    Err(e) => return Err(e),
+                    Ok(()) => {
+                        fetch = false;
+                        failures = 0;
+                    }
+                    Err(e) => note(&mut ws, &mut failures, &e),
                 }
             }
-            let snap = store.read()?;
-            if snap.queued > 0 {
-                // Queued posts must not sit until the next write.
-                store.deliver_queued_quietly();
-                store.read()?
-            } else {
-                snap
+            match store.read() {
+                Ok(snap) if snap.queued > 0 => {
+                    // Queued posts must not sit until the next write.
+                    store.deliver_queued_quietly();
+                    store.read()
+                }
+                other => other,
+            }
+        };
+        let snap = match snap {
+            Ok(s) => s,
+            Err(e) => {
+                note(&mut ws, &mut failures, &e);
+                let until = (Instant::now() + backoff(failures, poll_interval())).min(deadline);
+                if !nap(until, &newest) || Instant::now() >= deadline {
+                    return Ok(());
+                }
+                fetch = true;
+                continue;
             }
         };
         if !live(&arming, &snap.state) {
@@ -369,25 +410,26 @@ fn wait() -> Result<()> {
             } else {
                 idle_poll
             };
-            let mut until = (Instant::now() + poll).min(deadline);
+            let mut until = (Instant::now() + backoff(failures, poll)).min(deadline);
             if let Some(d) = due {
                 until = until.min(d);
             }
             if !nap(until, &newest) || Instant::now() >= deadline {
                 return Ok(());
             }
-            if due.is_some_and(|d| Instant::now() >= d) {
-                fetch = false;
+            if due.is_some_and(|d| Instant::now() >= d) || fetch {
+                // A held wake is due, or a failed fetch is retried.
                 break;
             }
             match store.remote_tip() {
-                Ok(tip) if tip.is_some() && tip != known => {
-                    fetch = true;
-                    break;
+                Ok(tip) => {
+                    failures = 0;
+                    if tip.is_some() && tip != known {
+                        fetch = true;
+                        break;
+                    }
                 }
-                Ok(_) => {}
-                Err(e) if e.kind == Kind::Offline => {}
-                Err(e) => return Err(e),
+                Err(e) => note(&mut ws, &mut failures, &e),
             }
         }
     }
