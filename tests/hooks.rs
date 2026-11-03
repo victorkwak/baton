@@ -1146,6 +1146,30 @@ fn guard_never_silently_allows_known_bypass_shapes() {
     ] {
         assert_eq!(decision(&bash(ws, &cmd, &s.repo)), Some("deny"), "{cmd}");
     }
+    // A variable assigned twice, or only conditionally, is not followed:
+    // its use is unresolved, so the guard asks instead of guessing.
+    for cmd in [
+        format!("D={bp}; D=/tmp; cd $D && ls {bb}"),
+        format!("D=/tmp; if true; then D={bp}; fi; cd $D && ls {bb}"),
+        format!("true || D={bp}; cd $D && ls {bb}"),
+        format!("(D={bp}); cd $D && ls {bb}"),
+        format!("for x in 1; do D={bp}; done; cd $D && ls {bb}"),
+    ] {
+        assert_eq!(decision(&bash(ws, &cmd, &s.repo)), Some("ask"), "{cmd}");
+    }
+    // Text evaluated again: single quotes and quoted here-documents are no
+    // longer literal (review: re-evaluation).
+    for cmd in [
+        "bash -c 'cd $D && git commit -m x'",
+        "sh -lc 'git --git-dir=$G commit'",
+        "eval 'git --git-dir=$G commit'",
+        "eval \"$(cat <<'EOF'\ngit --git-dir=$G commit\nEOF\n)\"",
+        "xargs -I{} sh -c 'GIT_DIR=$0 git commit' {} < dirs",
+        "env -S 'GIT_DIR=$G git commit'",
+        ". ./env.sh && git --namespace='$N' log",
+    ] {
+        asks_or_denies(ws, cmd, &s.repo);
+    }
     // ... and the notes repo is the notes repo.
     let nb = s.notes.file_name().unwrap().to_str().unwrap();
     let np = s.notes.parent().unwrap().to_str().unwrap();

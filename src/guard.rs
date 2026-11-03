@@ -185,14 +185,17 @@ fn bash(t: &str, ctx: &Ctx, d: &mut Decision) {
     let toks = tokens(t);
     let has = |w: &str| toks.iter().any(|t| t == w);
     let git = has("git");
-    let loose = loose_words(t);
+    let reeval = re_evaluates(t);
+    let loose = loose_words(t, reeval);
     let roots: Vec<&Path> = [ctx.board.as_deref(), ctx.notes.as_deref()]
         .into_iter()
         .flatten()
         .collect();
     // An expansion is unknown. It matters where it decides the directory
     // or repository (or anywhere, when the cwd is already in a baton repo).
-    let strict = roots.iter().any(|r| inside(&ctx.cwd, r));
+    // Text evaluated again (`bash -c '…'`, `eval`) is not read at all: any
+    // expansion in it counts.
+    let strict = reeval || roots.iter().any(|r| inside(&ctx.cwd, r));
     let mut unresolved = located_expansion(&loose, &roots, strict);
     // Variables assigned in the command: also check the text with their
     // values put in.
@@ -211,7 +214,7 @@ fn bash(t: &str, ctx: &Ctx, d: &mut Decision) {
     let mut lists: Vec<Vec<Option<String>>> = Vec::new();
     for text in &texts {
         lists.push(
-            loose_words(text)
+            loose_words(text, reeval)
                 .into_iter()
                 .map(|w| w.map(|w| w.text))
                 .collect(),
@@ -599,37 +602,55 @@ fn names(t: &str, root: &Path) -> bool {
 struct Loose {
     text: String,
     dynamic: bool,
+    /// The separator before this word's command (`\0` at the start).
+    after: char,
+    /// Unquoted `(` depth (a subshell or group) at this word.
+    paren: i32,
 }
 
 /// Words of `t` for a loose scan, not a parse: quotes removed, a backslash
 /// keeps the next character, `None` between commands (`; & | ( )`, newline).
 /// A `$(…)`, `${…}` or backtick group stays inside its word.
-fn loose_words(t: &str) -> Vec<Option<Loose>> {
+///
+/// With `reeval` (the text holds a command that evaluates text again, such
+/// as `bash -c` or `eval`), `$` and backticks in single quotes and quoted
+/// here-documents count as expansions too.
+fn loose_words(t: &str, reeval: bool) -> Vec<Option<Loose>> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut in_word = false;
     let mut dynamic = false;
     let mut quote: Option<char> = None;
+    let (mut after, mut paren) = ('\0', 0i32);
     let chars: Vec<char> = t.chars().collect();
     let mut i = 0;
-    let flush =
-        |out: &mut Vec<Option<Loose>>, cur: &mut String, in_word: &mut bool, dy: &mut bool| {
-            if *in_word {
-                out.push(Some(Loose {
-                    text: std::mem::take(cur),
-                    dynamic: std::mem::take(dy),
-                }));
-                *in_word = false;
-            }
-        };
+    let flush = |out: &mut Vec<Option<Loose>>,
+                 cur: &mut String,
+                 in_word: &mut bool,
+                 dy: &mut bool,
+                 after: char,
+                 paren: i32| {
+        if *in_word {
+            out.push(Some(Loose {
+                text: std::mem::take(cur),
+                dynamic: std::mem::take(dy),
+                after,
+                paren,
+            }));
+            *in_word = false;
+        }
+    };
     while i < chars.len() {
         let c = chars[i];
         i += 1;
+        if quote == Some('\'') && reeval && (c == '$' || c == '`') {
+            dynamic = true;
+        }
         if quote != Some('\'') && (c == '$' || c == '`') {
             in_word = true;
             let end = group_end(&chars, i - 1);
             let group: String = chars[i - 1..end].iter().collect();
-            if !literal_heredoc(&group) {
+            if reeval || !literal_heredoc(&group) {
                 dynamic = true;
             }
             cur.push_str(&group);
@@ -659,11 +680,17 @@ fn loose_words(t: &str) -> Vec<Option<Loose>> {
                 }
             }
             (None, ';' | '&' | '|' | '(' | ')' | '\n') => {
-                flush(&mut out, &mut cur, &mut in_word, &mut dynamic);
+                flush(&mut out, &mut cur, &mut in_word, &mut dynamic, after, paren);
                 out.push(None);
+                after = c;
+                paren += match c {
+                    '(' => 1,
+                    ')' => -1,
+                    _ => 0,
+                };
             }
             (None, c) if c.is_whitespace() || c == '<' || c == '>' => {
-                flush(&mut out, &mut cur, &mut in_word, &mut dynamic);
+                flush(&mut out, &mut cur, &mut in_word, &mut dynamic, after, paren);
             }
             (None, c) => {
                 cur.push(c);
@@ -671,8 +698,36 @@ fn loose_words(t: &str) -> Vec<Option<Loose>> {
             }
         }
     }
-    flush(&mut out, &mut cur, &mut in_word, &mut dynamic);
+    flush(&mut out, &mut cur, &mut in_word, &mut dynamic, after, paren);
     out
+}
+
+/// Does `t` hold a command that evaluates text again: `sh`/`bash`/`zsh`/
+/// `dash`/`ksh` with `-c`, `eval`, `xargs`, `env -S`, `source` or `.`?
+fn re_evaluates(t: &str) -> bool {
+    let words = loose_words(t, false);
+    words.split(Option::is_none).any(|seg| {
+        let seg: Vec<&str> = seg.iter().flatten().map(|w| w.text.as_str()).collect();
+        let base = |w: &str| w.rsplit('/').next().unwrap_or(w).to_owned();
+        let shell_c = seg.iter().enumerate().any(|(i, w)| {
+            matches!(base(w).as_str(), "sh" | "bash" | "zsh" | "dash" | "ksh")
+                && seg[i + 1..]
+                    .iter()
+                    .any(|o| o.starts_with('-') && !o.starts_with("--") && o.contains('c'))
+        });
+        let env_s = seg.iter().enumerate().any(|(i, w)| {
+            base(w) == "env"
+                && seg[i + 1..]
+                    .iter()
+                    .any(|o| o.starts_with("-S") || o.starts_with("--split-string"))
+        });
+        shell_c
+            || env_s
+            || seg
+                .iter()
+                .any(|w| matches!(*w, "eval" | "xargs" | "source"))
+            || seg.first() == Some(&".")
+    })
 }
 
 /// The end (exclusive) of the expansion starting at `chars[start]` (`$` or
@@ -823,19 +878,57 @@ fn home_only(w: &str) -> bool {
 }
 
 /// Plain assignments in the command (`X=…`, `export X=…`, `declare -x X=…`,
-/// `local X=…`): name and value, for values without expansions.
+/// `local X=…` at the start of a command): name and value. Only a variable
+/// assigned exactly once, unconditionally (at the top level, not after
+/// `&&`, `||` or `|`, not in a loop, conditional or subshell) and to a value
+/// without expansions is returned; others stay unresolved.
 fn assignments(words: &[Option<Loose>]) -> Vec<(String, String)> {
-    words
-        .iter()
-        .flatten()
-        .filter(|w| !w.dynamic || home_only(w.text.split_once('=').map_or("", |(_, v)| v)))
-        .filter_map(|w| {
-            let (name, value) = w.text.split_once('=')?;
+    let mut seen: Vec<(String, Option<String>)> = Vec::new();
+    let mut depth = 0i32;
+    for seg in words.split(Option::is_none) {
+        let seg: Vec<&Loose> = seg.iter().flatten().collect();
+        let mut i = 0;
+        while let Some(w) = seg.get(i) {
+            match w.text.as_str() {
+                "if" | "for" | "while" | "until" | "case" | "select" | "{" => depth += 1,
+                "fi" | "done" | "esac" | "}" => depth -= 1,
+                "then" | "do" | "else" | "elif" | "!" | "time" => {}
+                _ => break,
+            }
+            i += 1;
+        }
+        if seg.get(i).is_some_and(|w| {
+            matches!(
+                w.text.as_str(),
+                "export" | "declare" | "local" | "readonly" | "typeset"
+            )
+        }) {
+            i += 1;
+            while seg.get(i).is_some_and(|w| w.text.starts_with('-')) {
+                i += 1;
+            }
+        }
+        while let Some(w) = seg.get(i) {
+            let Some((name, value)) = w.text.split_once('=') else {
+                break;
+            };
             let ok = !name.is_empty()
                 && !name.starts_with(|c: char| c.is_ascii_digit())
                 && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-            ok.then(|| (name.to_owned(), value.to_owned()))
-        })
+            if !ok {
+                break;
+            }
+            let plain = depth == 0
+                && w.paren == 0
+                && matches!(w.after, '\0' | ';' | '\n')
+                && (!w.dynamic || home_only(value));
+            seen.push((name.to_owned(), plain.then(|| value.to_owned())));
+            i += 1;
+        }
+    }
+    seen.iter()
+        .filter(|(n, _)| seen.iter().filter(|(m, _)| m == n).count() == 1)
+        .filter_map(|(n, v)| Some((n.clone(), v.clone()?)))
         .collect()
 }
 
