@@ -1225,6 +1225,14 @@ fn guard_never_silently_allows_known_bypass_shapes() {
         "git $(echo -C) $X commit",
         "env $E git commit",
         "git commit -m \"$(cat <<EOF\n$(git -C x push)\nEOF\n)\"",
+        // Variable-setting builtins with a dynamic argument, any `GIT_…=`
+        // and the shell's directory variables (review 4).
+        "export \"$V\"; git commit -m x",
+        "declare -x \"$A\"; git commit -m x",
+        "export GIT_INDEX_FILE=$I; git commit -m x",
+        "GIT_OBJECT_DIRECTORY=$O git commit -m x",
+        "OLDPWD=$D; cd - && git commit -m x",
+        "CDPATH=$P; cd notes && git commit -m x",
     ] {
         asks_or_denies(ws, cmd, &s.repo);
     }

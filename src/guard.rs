@@ -854,10 +854,31 @@ fn located_expansion(words: &[Option<Loose>], roots: &[&Path], strict: bool) -> 
             if !w.dynamic || home_only(&w.text) {
                 continue;
             }
+            // Any `GIT_…=` assignment can change where git acts, as can the
+            // shell's own directory variables.
+            let git_var = w
+                .text
+                .find("GIT_")
+                .is_some_and(|at| w.text[at..].contains('='));
+            let dir_var = ["OLDPWD=", "CDPATH=", "PWD="]
+                .iter()
+                .any(|p| w.text.contains(p));
+            // An argument of a builtin that sets variables (`export "$V"`,
+            // `declare -x "$A"`, `env $E`) may set any of those.
+            let setter = seg.first().is_some_and(|c| {
+                !c.dynamic
+                    && matches!(
+                        c.text.as_str(),
+                        "export" | "declare" | "typeset" | "readonly" | "local" | "env" | "set"
+                    )
+            });
             let located = strict
                 || cd_target
                 || prev.is_some_and(|p| LOC_OPTS.contains(&p))
                 || LOC_PREFIXES.iter().any(|p| w.text.contains(p))
+                || git_var
+                || dir_var
+                || (setter && i > 0)
                 || git_at.is_some_and(|g| i < g)
                 || git_at.zip(sub_at).is_some_and(|(g, s)| i > g && i <= s)
                 || roots.iter().any(|r| could_name(&w.text, r));
