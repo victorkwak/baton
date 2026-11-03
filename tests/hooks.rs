@@ -529,6 +529,12 @@ fn guard_notes_repo_allows_only_read_only_git() {
     ] {
         assert_eq!(decision(&bash(ws, &cmd, &elsewhere)), Some("deny"), "{cmd}");
     }
+    // `git` as data is not a git call; `find -exec git` is.
+    assert_eq!(bash(ws, "grep -rn git .", notes), None);
+    assert_eq!(
+        decision(&bash(ws, "find . -name '*.md' -exec git add {} +", notes)),
+        Some("ask")
+    );
     // Read-only from elsewhere through -C is fine.
     assert_eq!(bash(ws, &format!("git -C {n} status"), &elsewhere), None);
     // A subdirectory is still the notes repo.

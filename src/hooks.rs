@@ -844,11 +844,23 @@ fn walk(
             }
             "git" => out.push(Invocation::Git(parse_git(&words[1..], dir, false))),
             _ => {
-                if let Some(p) = words
-                    .iter()
-                    .skip(1)
-                    .position(|w| !w.dynamic && basename(&w.text) == "git")
-                {
+                // A program that runs its arguments as a command: `find
+                // -exec git ...`, `parallel git ...`. Elsewhere `git` is data
+                // (`grep git file`).
+                let runner = matches!(
+                    basename(&first.text),
+                    "parallel" | "flock" | "unbuffer" | "strace" | "ltrace" | "systemd-run"
+                );
+                let exec_flag = |i: usize| {
+                    i > 0
+                        && matches!(
+                            words[i - 1].text.as_str(),
+                            "-exec" | "-execdir" | "-ok" | "-okdir"
+                        )
+                };
+                if let Some(p) = words.iter().enumerate().skip(1).position(|(i, w)| {
+                    !w.dynamic && basename(&w.text) == "git" && (runner || exec_flag(i))
+                }) {
                     out.push(Invocation::Git(parse_git(
                         &words[p + 2..],
                         dir.clone(),
