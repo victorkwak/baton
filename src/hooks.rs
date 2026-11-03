@@ -147,7 +147,7 @@ pub fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
 /// nothing outside Claude Code or without a session key. Call it after the
 /// board write, with the board lock held.
 pub fn arm(store: &Store, ids: &[&str]) -> Result<()> {
-    if std::env::var_os("CLAUDECODE").is_none() {
+    if !crate::identity::is_agent() {
         return Ok(());
     }
     let keys = env_keys();

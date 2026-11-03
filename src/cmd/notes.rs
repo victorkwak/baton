@@ -7,7 +7,7 @@ use clap::Args;
 use crate::Format;
 use crate::config::Config;
 use crate::error::{Error, Kind, Result};
-use crate::identity::Who;
+use crate::identity::{Who, is_agent};
 use crate::notes::{self, Options, Repo, Report, Select};
 use crate::output;
 
@@ -22,10 +22,6 @@ pub struct SyncArgs {
     /// Commit message.
     #[arg(short = 'm', long = "message")]
     pub message: Option<String>,
-}
-
-fn is_agent() -> bool {
-    std::env::var_os("CLAUDECODE").is_some()
 }
 
 /// The config and its notes repo, or a usage error.

@@ -43,8 +43,8 @@ check = ["wikiknit", "check"]      # optional command run on the merged tree; no
 | Who | How `baton` knows |
 |---|---|
 | This machine | `machine` in the config |
-| An agent | `CLAUDECODE=1` in the environment. The session is the hook's stdin `session_id`, else `CLAUDE_CODE_SESSION_ID`, else `<machine>-<pid>`. |
-| The human | No `CLAUDECODE`, and stdin is a TTY |
+| An agent | `CLAUDE_CODE_CHILD_SESSION` in the environment (Claude Code sets it only for its own tool processes). Without it, `CLAUDECODE` counts only when stdin is not a TTY: an IDE terminal opened from Claude Code inherits `CLAUDECODE`, and the human types there. The session is the hook's stdin `session_id`, else `CLAUDE_CODE_SESSION_ID`, else `<machine>-<pid>`. |
+| The human | Not an agent, and stdin is a TTY |
 
 There is no `--from` flag. `from: <human>` is written only for the human's identity.
 
@@ -114,8 +114,8 @@ Data goes to stdout, diagnostics to stderr. With no TTY, nothing prompts. Every 
 | `baton close <id> [--wontdo] [-m REPLY]` | `done`/`wontdo`, optionally with a reply in the same commit (`-m` required for `--wontdo`). |
 | `baton wait [--task S] [--reply-to ID] [--timeout 9m]` | Block until an actionable record arrives (prints its inbox line, exit 0) or the timeout ends (exit 3). |
 | `baton tasks` | Open tasks: lead, plan id, age, open counts, branch owners, items for the human. Flags `working` claims and unanswered messages older than 4 h as stale. |
-| `baton human handover\|close-task\|close\|release\|post --allow-secret` | The human's housekeeping. Refused when `CLAUDECODE` is set or stdin is not a TTY. |
-| `baton sync --paths P… [-m MSG]` / `baton sync --all` | Notes sync (below). `--all` is refused when `CLAUDECODE` is set. |
+| `baton human handover\|close-task\|close\|release\|post --allow-secret` | The human's housekeeping. Refused for an agent or when stdin is not a TTY. |
+| `baton sync --paths P… [-m MSG]` / `baton sync --all` | Notes sync (below). `--all` is refused for an agent. |
 | `baton sweep` | One pass of the idle sweeper (below). |
 | `baton hook wait\|guard` | Claude Code hooks (below). |
 | `baton init` | Write the config, clone the board, print the hook and permission settings to add. |

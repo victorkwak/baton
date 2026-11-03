@@ -188,6 +188,9 @@ impl Machine {
             .env_remove("XDG_CONFIG_HOME")
             .env_remove("XDG_DATA_HOME")
             .env_remove("XDG_STATE_HOME")
+            // Not inherited from a Claude Code session running the tests.
+            .env_remove("CLAUDE_CODE_CHILD_SESSION")
+            .env_remove("CLAUDE_PID")
             .stdin(Stdio::null());
         if self.agent {
             cmd.env("CLAUDECODE", "1")

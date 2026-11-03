@@ -650,7 +650,7 @@ pub fn tasks(format: Format) -> Result<()> {
 }
 
 pub fn human(format: Format, cmd: HumanCommand) -> Result<()> {
-    if std::env::var_os("CLAUDECODE").is_some() || !std::io::stdin().is_terminal() {
+    if crate::identity::is_agent() || !std::io::stdin().is_terminal() {
         crate::fail!(
             Rule,
             "rule human-only: `baton human` is for the human at a terminal; refused inside Claude Code or without a TTY"

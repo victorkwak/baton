@@ -369,6 +369,99 @@ fn an_agent_cannot_close_a_message_to_the_human() {
     plain.run(&["human", "close", &id]).code(10);
 }
 
+/// Run `baton <args>` with a pseudo-terminal on stdin (through `script`),
+/// with `m`'s environment plus `env`. `None` when `script` is missing.
+fn on_tty(m: &Machine, env: &[(&str, &str)], args: &str) -> Option<(i32, String)> {
+    let exe = env!("CARGO_BIN_EXE_baton");
+    let cmd = m.command(&[]);
+    let mut c = std::process::Command::new("script");
+    c.args(["-qec", &format!("{exe} {args}"), "/dev/null"]);
+    for (k, v) in cmd.get_envs() {
+        match v {
+            Some(v) => c.env(k, v),
+            None => c.env_remove(k),
+        };
+    }
+    for (k, v) in env {
+        c.env(k, v);
+    }
+    let out = c.output().ok()?;
+    Some((
+        out.status.code().unwrap(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    ))
+}
+
+/// The `from` and `session` of a message, read on the remote by `laptop`.
+fn from_and_session(laptop: &Machine, id: &str) -> (String, String) {
+    let v = laptop.run(&["--format", "json", "show", id]).json();
+    let item = &v["items"][0];
+    (
+        item["from"].as_str().unwrap().to_owned(),
+        item["session"].as_str().unwrap().to_owned(),
+    )
+}
+
+#[test]
+fn identity_agent_ide_terminal_and_script() {
+    if std::process::Command::new("script")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipped: no `script` to provide a TTY");
+        return;
+    }
+    let (_net, ws, laptop) = pair();
+    let mut plain = ws.clone();
+    plain.agent = false;
+    let post = |env: &[(&str, &str)], subject: &str| {
+        let (code, out) =
+            on_tty(&plain, env, &format!("post --to laptop -m body {subject}")).unwrap();
+        assert_eq!(code, 0, "{out}");
+        out.trim().to_owned()
+    };
+
+    // A Claude Code tool process: CLAUDE_CODE_CHILD_SESSION, even with a TTY.
+    let id = post(
+        &[
+            ("CLAUDECODE", "1"),
+            ("CLAUDE_CODE_CHILD_SESSION", "1"),
+            ("CLAUDE_CODE_SESSION_ID", "agent-s"),
+        ],
+        "agent",
+    );
+    assert_eq!(
+        from_and_session(&laptop, &id),
+        ("ws".into(), "agent-s".into())
+    );
+
+    // An IDE terminal opened from Claude Code: CLAUDECODE and a TTY, no
+    // CLAUDE_CODE_CHILD_SESSION. That is the human typing.
+    let id = post(
+        &[("CLAUDECODE", "1"), ("CLAUDE_CODE_SESSION_ID", "agent-s")],
+        "ide",
+    );
+    assert_eq!(
+        from_and_session(&laptop, &id),
+        (HUMAN.into(), String::new())
+    );
+    let (code, out) = on_tty(&plain, &[("CLAUDECODE", "1")], &format!("human close {id}")).unwrap();
+    assert_eq!(code, 0, "{out}");
+
+    // CLAUDECODE without a TTY (and without CLAUDE_CODE_CHILD_SESSION): an agent.
+    let id = ws.post("laptop", "agent without tty", &[]);
+    assert_eq!(
+        from_and_session(&laptop, &id),
+        ("ws".into(), "ws-session".into())
+    );
+
+    // A plain script: no Claude Code variables, no TTY: the machine.
+    let id = plain.post("laptop", "script", &[]);
+    assert_eq!(from_and_session(&laptop, &id), ("ws".into(), String::new()));
+    plain.run(&["human", "close", &id]).code(10);
+}
+
 #[test]
 fn the_human_at_a_terminal_closes_and_hands_over() {
     if std::process::Command::new("script")
