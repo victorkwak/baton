@@ -186,11 +186,14 @@ fn bash(t: &str, ctx: &Ctx, d: &mut Decision) {
     let has = |w: &str| toks.iter().any(|t| t == w);
     let git = has("git");
     let loose = loose_words(t);
-    // Any expansion is unknown, except `$HOME/…` and a quoted here-document.
-    let mut unresolved = loose
-        .iter()
+    let roots: Vec<&Path> = [ctx.board.as_deref(), ctx.notes.as_deref()]
+        .into_iter()
         .flatten()
-        .any(|w| w.dynamic && !home_only(&w.text));
+        .collect();
+    // An expansion is unknown. It matters where it decides the directory
+    // or repository (or anywhere, when the cwd is already in a baton repo).
+    let strict = roots.iter().any(|r| inside(&ctx.cwd, r));
+    let mut unresolved = located_expansion(&loose, &roots, strict);
     // Variables assigned in the command: also check the text with their
     // values put in.
     let vars = assignments(&loose);
@@ -233,10 +236,6 @@ fn bash(t: &str, ctx: &Ctx, d: &mut Decision) {
         .collect();
     cands.sort_unstable();
     cands.dedup();
-    let roots: Vec<&Path> = [ctx.board.as_deref(), ctx.notes.as_deref()]
-        .into_iter()
-        .flatten()
-        .collect();
     // Does the command run in, or name, something inside `root`?
     let hits = |root: &Path| {
         dirs.iter().any(|d| inside(d, root))
@@ -756,6 +755,63 @@ fn heredoc_group_len(s: &str) -> Option<usize> {
 /// Is `group` exactly `$(cat <<'X'` … `X` `)` (a literal text)?
 fn literal_heredoc(group: &str) -> bool {
     heredoc_group_len(group).is_some_and(|l| l == group.chars().count())
+}
+
+/// Does an expansion (other than `$HOME/…`) sit where it decides which
+/// directory or repository a command acts in? That is: the target of
+/// `cd`/`pushd`/`popd`, a `-C`, `--git-dir`, `--work-tree` or
+/// `--namespace` value, a `GIT_DIR=`/`GIT_WORK_TREE=`/`GIT_COMMON_DIR=`
+/// value, a word before `git` in its command (`env $E git`) or among git's
+/// options before the subcommand, or a word that could name a baton repo.
+/// With `strict` (the cwd is in a baton repo), any expansion counts.
+fn located_expansion(words: &[Option<Loose>], roots: &[&Path], strict: bool) -> bool {
+    const LOC_OPTS: &[&str] = &["-C", "--git-dir", "--work-tree", "--namespace"];
+    const LOC_PREFIXES: &[&str] = &[
+        "--git-dir=",
+        "--work-tree=",
+        "--namespace=",
+        "GIT_DIR=",
+        "GIT_WORK_TREE=",
+        "GIT_COMMON_DIR=",
+    ];
+    for seg in words.split(Option::is_none) {
+        let seg: Vec<&Loose> = seg.iter().flatten().collect();
+        let git_at = seg.iter().position(|w| !w.dynamic && w.text == "git");
+        // The first plain word after `git` that is not an option or an
+        // option's value: the subcommand.
+        let sub_at = git_at.map(|g| {
+            let mut i = g + 1;
+            while let Some(w) = seg.get(i) {
+                let value = matches!(seg[i - 1].text.as_str(), "-C" | "-c");
+                if w.dynamic || (!w.text.starts_with('-') && !value) {
+                    break;
+                }
+                i += 1;
+            }
+            i
+        });
+        let mut after_cd = false;
+        for (i, w) in seg.iter().enumerate() {
+            let prev = i.checked_sub(1).map(|p| seg[p].text.as_str());
+            let cd_target = after_cd && !w.text.starts_with('-');
+            after_cd = matches!(w.text.as_str(), "cd" | "pushd" | "popd")
+                || (after_cd && !cd_target && w.text.starts_with('-'));
+            if !w.dynamic || home_only(&w.text) {
+                continue;
+            }
+            let located = strict
+                || cd_target
+                || prev.is_some_and(|p| LOC_OPTS.contains(&p))
+                || LOC_PREFIXES.iter().any(|p| w.text.contains(p))
+                || git_at.is_some_and(|g| i < g)
+                || git_at.zip(sub_at).is_some_and(|(g, s)| i > g && i <= s)
+                || roots.iter().any(|r| could_name(&w.text, r));
+            if located {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Is a dynamic word only `$HOME/…` or `${HOME}/…` with a literal rest?

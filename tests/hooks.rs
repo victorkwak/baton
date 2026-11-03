@@ -849,6 +849,25 @@ fn guard_is_silent_without_git_and_on_other_tools() {
         bash(ws, &format!("cd {parent} && git status && ls"), &s.repo),
         None
     );
+    // The same expansions from inside the notes repo, or naming it, ask.
+    let n = s.notes.to_str().unwrap();
+    for (cmd, cwd) in [
+        ("git diff $BASE".to_owned(), s.notes.as_path()),
+        (
+            "for f in *.md; do git add \"$f\"; done".to_owned(),
+            s.notes.as_path(),
+        ),
+        (
+            format!("git commit -m \"$(cat <<EOF\nsee {n}/x\nEOF\n)\""),
+            s.repo.as_path(),
+        ),
+        (
+            "git commit -m \"$(cat <<EOF\nfix: push it\nEOF\n)\"".to_owned(),
+            s.repo.as_path(),
+        ),
+    ] {
+        assert_eq!(decision(&bash(ws, &cmd, cwd)), Some("ask"), "{cmd}");
+    }
     for cmd in [
         "ls -la",
         "cargo test 2>&1 | tail",
@@ -862,6 +881,12 @@ fn guard_is_silent_without_git_and_on_other_tools() {
         "git commit -m \"$(cat <<'EOF'\nfix: guard (part 1\n\nit's done: $x `y`\nEOF\n)\"",
         "git log --format='%h $x'",
         "echo $PATH && ls $HOME/.config",
+        // Expansions in ordinary arguments, away from the baton repos.
+        "git add \"$f\"",
+        "git diff $BASE",
+        "git log --since=\"$(date -d yesterday)\" -- src",
+        "for f in *.md; do git add \"$f\"; done",
+        "git commit -m \"$(cat <<EOF\nfix: guard ($PART) it's `x`\nEOF\n)\"",
     ] {
         assert_eq!(bash(ws, cmd, &s.repo), None, "{cmd}");
     }
