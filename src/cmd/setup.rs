@@ -108,7 +108,11 @@ pub fn claude_settings(exe: &Path) -> Value {
                 "Bash(baton show:*)",
                 "Bash(baton tasks:*)",
                 "Bash(baton wait:*)",
-                "Bash(baton doctor:*)"
+                "Bash(baton doctor:*)",
+                "Bash(baton post:*)",
+                "Bash(baton take:*)",
+                "Bash(baton close:*)",
+                "Bash(baton release:*)"
             ]
         }
     })

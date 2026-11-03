@@ -2,7 +2,7 @@
 name: baton
 description: Pick up work that another machine's agent left on the baton board, or hand work to another machine. Use when the human runs /baton or /baton <id>, or asks you to post a plan, a handover, a reply or a close with baton. Never check the board or take work on your own initiative.
 argument-hint: "[message id]"
-allowed-tools: Bash(baton inbox:*), Bash(baton show:*), Bash(baton tasks:*), Bash(baton wait:*)
+allowed-tools: Bash(baton inbox:*), Bash(baton show:*), Bash(baton tasks:*), Bash(baton wait:*), Bash(baton post:*), Bash(baton take:*), Bash(baton close:*), Bash(baton release:*)
 ---
 
 # baton: work handed between machines
