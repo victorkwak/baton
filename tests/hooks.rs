@@ -1233,6 +1233,14 @@ fn guard_never_silently_allows_known_bypass_shapes() {
         "GIT_OBJECT_DIRECTORY=$O git commit -m x",
         "OLDPWD=$D; cd - && git commit -m x",
         "CDPATH=$P; cd notes && git commit -m x",
+        // Setters anywhere in the segment, more setters, HOME (review 5).
+        "if export \"$V\"; then git commit -m x; fi",
+        "builtin declare -x \"$A\"; git commit -m x",
+        "/usr/bin/env \"$E\" git commit -m x",
+        "printf -v GIT_DIR %s \"$G\"; export GIT_DIR; git commit -m x",
+        "read -r GIT_DIR <<< \"$G\"; export GIT_DIR; git commit -m x",
+        "HOME=$H; git -C $HOME/notes commit -m x",
+        "export HOME=/tmp/x; cd ~/notes && git commit -m x",
     ] {
         asks_or_denies(ws, cmd, &s.repo);
     }

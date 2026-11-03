@@ -820,6 +820,11 @@ fn literal_heredoc(group: &str) -> bool {
 /// options before the subcommand, or a word that could name a baton repo.
 /// With `strict` (the cwd is in a baton repo), any expansion counts.
 fn located_expansion(words: &[Option<Loose>], roots: &[&Path], strict: bool) -> bool {
+    // A command that assigns HOME loses the `$HOME/…` exemption.
+    let home_reassigned = words
+        .iter()
+        .flatten()
+        .any(|w| w.text.contains("HOME=") || w.text.contains("HOME+="));
     const LOC_OPTS: &[&str] = &["-C", "--git-dir", "--work-tree", "--namespace"];
     const LOC_PREFIXES: &[&str] = &[
         "--git-dir=",
@@ -851,7 +856,11 @@ fn located_expansion(words: &[Option<Loose>], roots: &[&Path], strict: bool) -> 
             let cd_target = after_cd && !w.text.starts_with('-');
             after_cd = matches!(w.text.as_str(), "cd" | "pushd" | "popd")
                 || (after_cd && !cd_target && w.text.starts_with('-'));
-            if !w.dynamic || home_only(&w.text) {
+            // With HOME reassigned, `~` no longer means the real home.
+            if home_reassigned && !w.dynamic && w.text.starts_with('~') {
+                return true;
+            }
+            if !w.dynamic || (home_only(&w.text) && !home_reassigned) {
                 continue;
             }
             // Any `GIT_…=` assignment can change where git acts, as can the
@@ -860,16 +869,29 @@ fn located_expansion(words: &[Option<Loose>], roots: &[&Path], strict: bool) -> 
                 .text
                 .find("GIT_")
                 .is_some_and(|at| w.text[at..].contains('='));
-            let dir_var = ["OLDPWD=", "CDPATH=", "PWD="]
+            let dir_var = ["OLDPWD=", "CDPATH=", "PWD=", "HOME=", "XDG_CONFIG_HOME="]
                 .iter()
                 .any(|p| w.text.contains(p));
             // An argument of a builtin that sets variables (`export "$V"`,
             // `declare -x "$A"`, `env $E`) may set any of those.
-            let setter = seg.first().is_some_and(|c| {
+            // Anywhere in the segment, by basename, so `if export …`,
+            // `builtin declare …` or `/usr/bin/env …` count too.
+            let setter = seg.iter().any(|c| {
                 !c.dynamic
                     && matches!(
-                        c.text.as_str(),
-                        "export" | "declare" | "typeset" | "readonly" | "local" | "env" | "set"
+                        c.text.rsplit('/').next().unwrap_or(&c.text),
+                        "export"
+                            | "declare"
+                            | "typeset"
+                            | "readonly"
+                            | "local"
+                            | "env"
+                            | "set"
+                            | "printf"
+                            | "read"
+                            | "mapfile"
+                            | "readarray"
+                            | "getopts"
                     )
             });
             let located = strict
@@ -878,7 +900,7 @@ fn located_expansion(words: &[Option<Loose>], roots: &[&Path], strict: bool) -> 
                 || LOC_PREFIXES.iter().any(|p| w.text.contains(p))
                 || git_var
                 || dir_var
-                || (setter && i > 0)
+                || setter
                 || git_at.is_some_and(|g| i < g)
                 || git_at.zip(sub_at).is_some_and(|(g, s)| i > g && i <= s)
                 || roots.iter().any(|r| could_name(&w.text, r));
