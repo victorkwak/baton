@@ -369,13 +369,33 @@ fn an_agent_cannot_close_a_message_to_the_human() {
     plain.run(&["human", "close", &id]).code(10);
 }
 
+/// `script` running the shell command `line` on a pseudo-terminal.
+/// util-linux and BSD (macOS) `script` take different arguments.
+fn script(line: &str) -> std::process::Command {
+    let mut c = std::process::Command::new("script");
+    if cfg!(target_os = "linux") {
+        c.args(["-qec", line, "/dev/null"]);
+    } else {
+        c.args(["-q", "/dev/null", "sh", "-c", line]);
+    }
+    c
+}
+
+/// Can `script` give a command a TTY here? Runs it: a `script` that takes
+/// other arguments starts fine but fails.
+fn has_script() -> bool {
+    script("true")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
 /// Run `baton <args>` with a pseudo-terminal on stdin (through `script`),
 /// with `m`'s environment plus `env`. `None` when `script` is missing.
 fn on_tty(m: &Machine, env: &[(&str, &str)], args: &str) -> Option<(i32, String)> {
     let exe = env!("CARGO_BIN_EXE_baton");
     let cmd = m.command(&[]);
-    let mut c = std::process::Command::new("script");
-    c.args(["-qec", &format!("{exe} {args}"), "/dev/null"]);
+    let mut c = script(&format!("{exe} {args}"));
     for (k, v) in cmd.get_envs() {
         match v {
             Some(v) => c.env(k, v),
@@ -386,10 +406,10 @@ fn on_tty(m: &Machine, env: &[(&str, &str)], args: &str) -> Option<(i32, String)
         c.env(k, v);
     }
     let out = c.output().ok()?;
-    Some((
-        out.status.code().unwrap(),
-        String::from_utf8_lossy(&out.stdout).into_owned(),
-    ))
+    // BSD `script` echoes the end of its (empty) stdin as `^D` and two
+    // backspaces before the command's output.
+    let stdout = String::from_utf8_lossy(&out.stdout).replace("^D\u{8}\u{8}", "");
+    Some((out.status.code().unwrap(), stdout))
 }
 
 /// The `from` and `session` of a message, read on the remote by `laptop`.
@@ -404,11 +424,7 @@ fn from_and_session(laptop: &Machine, id: &str) -> (String, String) {
 
 #[test]
 fn identity_agent_ide_terminal_and_script() {
-    if std::process::Command::new("script")
-        .arg("--version")
-        .output()
-        .is_err()
-    {
+    if !has_script() {
         eprintln!("skipped: no `script` to provide a TTY");
         return;
     }
@@ -464,11 +480,7 @@ fn identity_agent_ide_terminal_and_script() {
 
 #[test]
 fn the_human_at_a_terminal_closes_and_hands_over() {
-    if std::process::Command::new("script")
-        .arg("--version")
-        .output()
-        .is_err()
-    {
+    if !has_script() {
         eprintln!("skipped: no `script` to provide a TTY");
         return;
     }
@@ -477,25 +489,7 @@ fn the_human_at_a_terminal_closes_and_hands_over() {
     ws.post("laptop", "plan", &["--task", "t", "--plan"]);
     let mut human = ws.clone();
     human.agent = false;
-    // `script` gives the command a pseudo-terminal on stdin.
-    let tty = |args: &str| {
-        let exe = env!("CARGO_BIN_EXE_baton");
-        let mut cmd = human.command(&["-qec", &format!("{exe} {args}"), "/dev/null"]);
-        cmd.env("PATH", std::env::var("PATH").unwrap());
-        let mut c = std::process::Command::new("script");
-        c.args(["-qec", &format!("{exe} {args}"), "/dev/null"]);
-        for (k, v) in cmd.get_envs() {
-            match v {
-                Some(v) => c.env(k, v),
-                None => c.env_remove(k),
-            };
-        }
-        let out = c.output().unwrap();
-        (
-            out.status.code().unwrap(),
-            String::from_utf8_lossy(&out.stdout).into_owned(),
-        )
-    };
+    let tty = |args: &str| on_tty(&human, &[], args).unwrap();
     // Only the human overrides the secret scan.
     let token = format!("ghp_{}", "a1B2c3D4e5".repeat(4));
     ws.run(&[
@@ -1044,11 +1038,7 @@ fn a_push_whose_result_is_unclear_is_checked_before_reporting() {
 
 #[test]
 fn a_message_to_any_taken_by_the_human_is_the_humans() {
-    if std::process::Command::new("script")
-        .arg("--version")
-        .output()
-        .is_err()
-    {
+    if !has_script() {
         eprintln!("skipped: no `script` to provide a TTY");
         return;
     }
@@ -1068,4 +1058,43 @@ fn a_message_to_any_taken_by_the_human_is_the_humans() {
     let (code, out) = on_tty(&human, &[], &format!("release {id}")).unwrap();
     assert_eq!(code, 0, "{out}");
     ws.run(&["take", &id]).ok();
+}
+
+#[test]
+fn doctor_warns_about_the_ssh_agent_only_when_ssh_fails() {
+    let (net, _ws, _laptop) = pair();
+    let tools = tempfile::TempDir::new().unwrap();
+    let (ssh, _refuse) = fake_ssh(tools.path());
+    let url = format!("ssh://git@github.invalid{}", net.bare.display());
+    let mut ws = net.machine("ws", TWO);
+    ws.write_config(&url, TWO);
+    // No agent: SSH works through a key file (here, the fake ssh).
+    ws.env.push(("SSH_AUTH_SOCK".into(), String::new()));
+    ws.env.push(("GIT_SSH_COMMAND".into(), ssh));
+    ws.run(&["inbox"]).ok();
+    let check = |m: &Machine, name: &str| {
+        let v = m.run(&["--format", "json", "doctor"]).json();
+        let item = v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["check"] == name)
+            .unwrap()
+            .clone();
+        (
+            item["status"].as_str().unwrap().to_owned(),
+            item["detail"].as_str().unwrap().to_owned(),
+        )
+    };
+    let (status, detail) = check(&ws, "ssh-agent");
+    assert_eq!(status, "ok", "{detail}");
+    assert!(detail.contains("reaches the board"), "{detail}");
+
+    // SSH fails: now the missing agent is worth a warning.
+    ws.env.retain(|(k, _)| k != "GIT_SSH_COMMAND");
+    ws.env.push(("GIT_SSH_COMMAND".into(), "false".into()));
+    assert_eq!(check(&ws, "board-remote").0, "fail");
+    let (status, detail) = check(&ws, "ssh-agent");
+    assert_eq!(status, "warn", "{detail}");
+    assert!(detail.contains("ssh-add"), "{detail}");
 }

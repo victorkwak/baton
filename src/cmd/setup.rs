@@ -489,7 +489,10 @@ fn check_hooks(r: &mut Report) {
     }
 }
 
-fn check_ssh(r: &mut Report, url: &str) {
+/// The agent is only one way to hold the SSH key: a key file without a
+/// passphrase, or the macOS Keychain, works too. So an agent without keys
+/// warns only when the board remote did not answer.
+fn check_ssh(r: &mut Report, url: &str, reachable: bool) {
     if !ssh_url(url) {
         r.add(
             Status::Ok,
@@ -498,13 +501,25 @@ fn check_ssh(r: &mut Report, url: &str) {
         );
         return;
     }
-    if std::env::var_os("SSH_AUTH_SOCK").is_none_or(|s| s.is_empty()) {
-        r.add(
+    match agent_state() {
+        Ok(detail) => r.add(Status::Ok, "ssh-agent", detail),
+        Err(problem) if reachable => r.add(
+            Status::Ok,
+            "ssh-agent",
+            format!("{problem}, but SSH reaches the board without it"),
+        ),
+        Err(problem) => r.add(
             Status::Warn,
             "ssh-agent",
-            "SSH_AUTH_SOCK is not set; git over SSH needs a key without a passphrase",
-        );
-        return;
+            format!("{problem}: load a key with `ssh-add`, or use a key file without a passphrase"),
+        ),
+    }
+}
+
+/// The keys the SSH agent holds, or why it holds none.
+fn agent_state() -> std::result::Result<String, String> {
+    if std::env::var_os("SSH_AUTH_SOCK").is_none_or(|s| s.is_empty()) {
+        return Err("SSH_AUTH_SOCK is not set".into());
     }
     let out = Command::new("ssh-add")
         .arg("-l")
@@ -514,30 +529,21 @@ fn check_ssh(r: &mut Report, url: &str) {
     match out {
         Ok(o) if o.status.success() => {
             let n = String::from_utf8_lossy(&o.stdout).lines().count();
-            r.add(Status::Ok, "ssh-agent", format!("{n} key(s) loaded"));
+            Ok(format!("{n} key(s) loaded"))
         }
-        Ok(o) if o.status.code() == Some(1) => r.add(
-            Status::Warn,
-            "ssh-agent",
-            "the agent holds no keys (`ssh-add`)",
-        ),
-        Ok(_) => r.add(
-            Status::Warn,
-            "ssh-agent",
-            "cannot reach the agent at SSH_AUTH_SOCK",
-        ),
-        Err(e) => r.add(
-            Status::Warn,
-            "ssh-agent",
-            format!("cannot run ssh-add: {e}"),
-        ),
+        Ok(o) if o.status.code() == Some(1) => Err("the agent holds no keys".into()),
+        Ok(_) => Err("cannot reach the agent at SSH_AUTH_SOCK".into()),
+        Err(e) => Err(format!("cannot run ssh-add: {e}")),
     }
 }
 
-fn check_board(r: &mut Report, config: &Config) {
+fn check_board(r: &mut Report, config: &Config) -> bool {
     let clone = match config.board_clone() {
         Ok(p) => p,
-        Err(e) => return r.add(Status::Fail, "board-clone", e.message),
+        Err(e) => {
+            r.add(Status::Fail, "board-clone", e.message);
+            return false;
+        }
     };
     if !clone.join(".git").exists() {
         r.add(
@@ -548,7 +554,7 @@ fn check_board(r: &mut Report, config: &Config) {
                 clone.display()
             ),
         );
-        return;
+        return false;
     }
     let git = Git::new(&clone);
     let url = git
@@ -574,17 +580,23 @@ fn check_board(r: &mut Report, config: &Config) {
     } else {
         r.add(Status::Ok, "board-clone", clone.display().to_string());
     }
-    match git.run(["ls-remote", "origin", "refs/heads/main"]) {
-        Ok(o) => match o.stdout_str().split_whitespace().next() {
-            Some(sha) => r.add(
-                Status::Ok,
-                "board-remote",
-                format!("reachable, main at {}", &sha[..sha.len().min(12)]),
-            ),
-            None => r.add(Status::Ok, "board-remote", "reachable, no messages yet"),
-        },
-        Err(e) => r.add(Status::Fail, "board-remote", e.message),
-    }
+    let reachable = match git.run(["ls-remote", "origin", "refs/heads/main"]) {
+        Ok(o) => {
+            match o.stdout_str().split_whitespace().next() {
+                Some(sha) => r.add(
+                    Status::Ok,
+                    "board-remote",
+                    format!("reachable, main at {}", &sha[..sha.len().min(12)]),
+                ),
+                None => r.add(Status::Ok, "board-remote", "reachable, no messages yet"),
+            }
+            true
+        }
+        Err(e) => {
+            r.add(Status::Fail, "board-remote", e.message);
+            false
+        }
+    };
     check_queue(r, config);
     // Locks and leftovers.
     let mut notes = Vec::new();
@@ -609,6 +621,7 @@ fn check_board(r: &mut Report, config: &Config) {
     } else {
         r.add(Status::Warn, "board-locks", notes.join("; "));
     }
+    reachable
 }
 
 fn check_notes(r: &mut Report, config: &Config) {
@@ -745,8 +758,8 @@ pub fn doctor(format: Format) -> Result<()> {
         }
     };
     if let Some(c) = &config {
-        check_board(&mut r, c);
-        check_ssh(&mut r, &c.board);
+        let reachable = check_board(&mut r, c);
+        check_ssh(&mut r, &c.board, reachable);
         check_notes(&mut r, c);
     }
     check_hooks(&mut r);
