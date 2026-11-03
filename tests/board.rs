@@ -403,6 +403,23 @@ fn the_human_at_a_terminal_closes_and_hands_over() {
             String::from_utf8_lossy(&out.stdout).into_owned(),
         )
     };
+    // Only the human overrides the secret scan.
+    let token = format!("ghp_{}", "a1B2c3D4e5".repeat(4));
+    ws.run(&[
+        "human",
+        "post",
+        "--allow-secret",
+        "--to",
+        "laptop",
+        "-m",
+        &token,
+        "key",
+    ])
+    .code(10);
+    let (code, out) = tty(&format!(
+        "human post --allow-secret --to laptop -m {token} key"
+    ));
+    assert_eq!(code, 0, "{out}");
     let (code, out) = tty(&format!("human close {id}"));
     assert_eq!(code, 0, "{out}");
     let (code, out) = tty("human handover t laptop");
@@ -769,4 +786,46 @@ fn overlapping_pushes_are_rejected_and_rechecked() {
     assert!(results.iter().all(|r| r.code == 0), "{results:?}");
     assert_eq!(ws.inbox_ids(false).len(), 2);
     assert_linear(&net);
+}
+
+#[test]
+fn records_that_break_a_rule_are_ignored_by_every_machine() {
+    let (net, ws, laptop) = pair();
+    let id = ws.post("laptop", "x", &[]);
+    // Write, outside baton, an event by the wrong machine and a file that
+    // does not parse.
+    let work = net.dir.path().join("rogue");
+    git(
+        net.dir.path(),
+        &["clone", "--quiet", &net.url(), work.to_str().unwrap()],
+    );
+    std::fs::create_dir_all(work.join("events")).unwrap();
+    let ev = format!(
+        "{{\"id\":\"01JBX3Z9Q8W7E6R5T4Y3U2V1W0\",\"at\":\"2026-01-01T00:00:00Z\",\"by\":\"ws\",\"msg\":\"{id}\",\"status\":\"done\"}}\n"
+    );
+    std::fs::write(work.join("events/01JBX3Z9Q8W7E6R5T4Y3U2V1W0.json"), ev).unwrap();
+    std::fs::write(work.join("events/01JBX3Z9Q8W7E6R5T4Y3U2V1W1.json"), "{}").unwrap();
+    git(&work, &["add", "."]);
+    git(
+        &work,
+        &[
+            "-c",
+            "user.name=x",
+            "-c",
+            "user.email=x@x",
+            "commit",
+            "--quiet",
+            "-m",
+            "rogue",
+        ],
+    );
+    git(&work, &["push", "--quiet", "origin", "HEAD:main"]);
+
+    let r = laptop.run(&["inbox"]);
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(r.stderr.contains("2 board record(s)"), "{r:?}");
+    assert_eq!(rows(&r.stdout)[0][0], id);
+    assert_eq!(rows(&r.stdout)[0][5], "open");
+    // The addressee can still close it.
+    laptop.run(&["close", &id]).ok();
 }
