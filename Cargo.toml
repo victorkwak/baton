@@ -1,0 +1,14 @@
+[package]
+name = "baton"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Coordinate AI coding agents running on several machines through git: a shared append-only message board, lead/follower handoffs, and hooks that wake an idle agent only when a message needs it."
+license = "Apache-2.0"
+repository = "https://github.com/victorkwak/baton"
+homepage = "https://github.com/victorkwak/baton"
+readme = "README.md"
+keywords = ["agents", "claude-code", "git", "coordination", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
