@@ -859,6 +859,9 @@ fn guard_is_silent_without_git_and_on_other_tools() {
         "git diff -C HEAD~1",
         "grep -C 3 git src",
         "mkdir -p build && cd build && cargo test",
+        "git commit -m \"$(cat <<'EOF'\nfix: guard (part 1\n\nit's done: $x `y`\nEOF\n)\"",
+        "git log --format='%h $x'",
+        "echo $PATH && ls $HOME/.config",
     ] {
         assert_eq!(bash(ws, cmd, &s.repo), None, "{cmd}");
     }
@@ -1092,6 +1095,37 @@ fn guard_never_silently_allows_known_bypass_shapes() {
     assert_eq!(decision(&run("cd notes; ls")), Some("ask"));
     assert_eq!(run("cd ./via-link && cargo test"), None);
     assert_eq!(run("cd src && cargo test"), None);
+    // Expansions are unknown: with git in the text they ask, from anywhere
+    // (review 3).
+    for cmd in [
+        "git --git-dir=$G commit -m x",
+        "GIT_DIR=$G git commit",
+        "git --work-tree=${W} add .",
+        "git -C \"$(cat dir.txt)\" commit",
+        "git -C `cat dir.txt` commit",
+        "git -C \"$(printf %s \"$X\")\"/sub commit",
+        "git $(echo -C) $X commit",
+        "env $E git commit",
+        "git commit -m \"$(cat <<EOF\n$(git -C x push)\nEOF\n)\"",
+    ] {
+        asks_or_denies(ws, cmd, &s.repo);
+    }
+    // Variables assigned in the command are followed: the board is denied.
+    for cmd in [
+        format!("D={bp}; cd $D && cd {bb} && ls"),
+        format!("D={bp}/{bb}; cd $D && ls"),
+        format!("export D={bp}; ls $D/{bb}"),
+        format!("declare -x D={bp}; rm -rf \"${{D}}/{bb}\""),
+        format!("local D={bpp}; cd $D/{bpb}/{bb} && ls"),
+        format!("D={bb}; cd {bp} && cat $D/x"),
+    ] {
+        assert_eq!(decision(&bash(ws, &cmd, &s.repo)), Some("deny"), "{cmd}");
+    }
+    // ... and the notes repo is the notes repo.
+    let nb = s.notes.file_name().unwrap().to_str().unwrap();
+    let np = s.notes.parent().unwrap().to_str().unwrap();
+    let d = bash(ws, &format!("N={np}/{nb}; git -C $N commit -m x"), &s.repo);
+    assert_eq!(decision(&d), Some("ask"));
     // Only the real baton is exempt in the board clone.
     for cmd in [
         format!("PATH=/tmp/x baton {b}"),
