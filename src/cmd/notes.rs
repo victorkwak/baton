@@ -119,10 +119,16 @@ pub fn sweep(format: Format) -> Result<()> {
     print(format, "sweep", &report);
     let left_out = result?;
     if !left_out.is_empty() {
-        crate::fail!(
-            CheckFailed,
-            "check failed for {}; left uncommitted, the rest synced",
-            left_out.join(", ")
+        // Reported, but exit 0: the timer runs every minute, and a
+        // non-zero exit would mark it failed every minute until a human
+        // fixes the file. `sync` keeps exit 22.
+        eprintln!(
+            "baton: check failed for {}; left uncommitted, the rest synced",
+            left_out
+                .iter()
+                .map(|p| output::field(p))
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
     Ok(())

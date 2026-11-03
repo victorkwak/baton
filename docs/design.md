@@ -163,7 +163,7 @@ Data goes to stdout, diagnostics to stderr. With no TTY, nothing prompts. Every 
 
 `baton sync --all` is the same with every changed path, for the human and the sweeper.
 
-`baton sweep` (run every minute by a systemd user timer or a launchd agent): when no tracked file in the notes repo changed for 5 minutes and no lock is held, it runs `sync --all` with `Baton-Session: sweep`. Files whose check fails are left out and reported. It also pulls, so each machine stays current while no agent runs.
+`baton sweep` (run every minute by a systemd user timer or a launchd agent): when no tracked file in the notes repo changed for 5 minutes and no lock is held, it runs `sync --all` with `Baton-Session: sweep`. Files whose check fails are left out and reported on stderr; the rest is synced and the sweep exits 0 (the timer runs every minute, and a non-zero exit would mark it failed every minute). `sync` still exits 22 for a failed check. It also pulls, so each machine stays current while no agent runs.
 
 ## Picking up work: `/baton`
 

@@ -537,9 +537,12 @@ fn sweep_commits_after_idle_and_leaves_out_failing_files() {
     assert_eq!(stdout(&out), "");
     assert_eq!(ws.status().len(), 2);
 
+    // The failing file is left out and reported on stderr; the timer's
+    // run still succeeds (exit 0), or it would fail every minute.
     let out = ws.baton_env(&["sweep"], &[("BATON_SWEEP_IDLE_SECS", "0")]);
-    assert_eq!(code(&out), 22, "{}", stderr(&out));
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
     assert!(stderr(&out).contains("bad.md"), "{}", stderr(&out));
+    assert!(stderr(&out).contains("check failed"), "{}", stderr(&out));
     let text = stdout(&out);
     assert!(text.contains("left-out\t\tbad.md"), "{text}");
     assert!(
