@@ -552,6 +552,9 @@ fn guard_notes_repo_reads_are_silent_writes_denied_rest_asks() {
         "git show HEAD:x.md",
         "git --no-pager blame a.md",
         "git grep -n foo",
+        "git grep -C 3 foo",
+        "git diff -- a.md",
+        "git log -p -- -",
         "git rev-parse --show-toplevel",
         "ls -la",
         "wc -l *.md | tail -1",
@@ -585,6 +588,11 @@ fn guard_notes_repo_reads_are_silent_writes_denied_rest_asks() {
         "git status && git diff",
         "git log --output=/tmp/x",
         "git log --out=/tmp/x",
+        "git log -- --output=/tmp/x",
+        "git log -n --output=/tmp/x",
+        "git log --format --output=/tmp/x",
+        "git grep -e --open-files-in-pager=vim foo",
+        "git diff HEAD -- -O x",
         "git grep -O foo",
         "git grep --open-files-in-pager=vim foo",
         "git diff --ext-diff",
@@ -823,12 +831,21 @@ fn guard_pushes() {
 fn guard_is_silent_without_git_and_on_other_tools() {
     let s = guard_setup();
     let ws = &s.ws;
+    let parent = s.notes.parent().unwrap().to_str().unwrap().to_owned();
+    assert_eq!(
+        bash(ws, &format!("cd {parent} && git status && ls"), &s.repo),
+        None
+    );
     for cmd in [
         "ls -la",
         "cargo test 2>&1 | tail",
         "echo 'gh repo view github.com/x/legit'",
         "git commit -m x",
         "git status && git log --oneline -3",
+        "cd /tmp && git status",
+        "git diff -C HEAD~1",
+        "grep -C 3 git src",
+        "mkdir -p build && cd build && cargo test",
     ] {
         assert_eq!(bash(ws, cmd, &s.repo), None, "{cmd}");
     }
@@ -955,6 +972,27 @@ fn guard_never_silently_allows_known_bypass_shapes() {
         "f() { exit; }; git -C {T} commit",
         "bash -c 'f(){ exit; }; git -C {T} commit'",
         "true || exit; git -C {T} commit",
+        // directory changes in steps (review 2026-11-03, findings 1 and 2)
+        "cd {TP} && cd {TB} && git commit -m x",
+        "cd {TP}; cd {TB}; git add .",
+        "cd {TP} && cd ./{TB}/ && git commit",
+        "pushd {TP} && pushd {TB} && git commit",
+        "cd {TP} && git -C {TB} commit",
+        "cd {TP} && env -C {TB} git commit",
+        "cd {TP} && git --git-dir={TB}/.git commit",
+        "cd {TP} && GIT_DIR={TB}/.git git commit",
+        "cd {TP}/missing/.. && cd {TB} && git commit",
+        "cd $D && git commit",
+        "cd ${D} && git commit",
+        "cd `pwd` && git commit",
+        "cd $(pwd) && git commit",
+        "cd {TP}/* && git commit",
+        "cd - && git commit",
+        "cd ~nobody && git commit",
+        // option checks after `--` and after value-taking options (finding 3)
+        "git -C {T} log -- --output=/tmp/x",
+        "git -C {T} log -n --output=/tmp/x",
+        "git -C {T} grep -e --open-files-in-pager=x foo",
         // unparseable or unknown programs
         "git -C {T} commit -m \"open",
         "$GIT -C {T} commit",
@@ -966,15 +1004,54 @@ fn guard_never_silently_allows_known_bypass_shapes() {
             if target == &b && shape.contains("{L}") {
                 continue;
             }
+            let tp = Path::new(target.as_str())
+                .parent()
+                .unwrap()
+                .to_str()
+                .unwrap();
+            let tb = Path::new(target.as_str())
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap();
             let cmd = shape
+                .replace("{TP}", tp)
+                .replace("{TB}", tb)
                 .replace("{T}", target)
                 .replace("{R}", &r)
                 .replace("{L}", &l);
             asks_or_denies(ws, &cmd, Path::new(target));
-            if shape.contains("{T}") || shape.contains("{L}") {
+            if ["{T", "{L}"].iter().any(|p| shape.contains(p)) {
                 asks_or_denies(ws, &cmd, &s.repo);
             }
         }
+    }
+    // The board clone through directory changes, without git.
+    let bp = ws.clone_dir().parent().unwrap().to_owned();
+    let (bpp, bpb) = (
+        bp.parent().unwrap(),
+        bp.file_name().unwrap().to_str().unwrap(),
+    );
+    let bb = ws
+        .clone_dir()
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let bpp = bpp.to_str().unwrap();
+    let bp = bp.to_str().unwrap();
+    for cmd in [
+        format!("cd {bpp} && cd {bpb} && cd {bb} && ls"),
+        format!("cd {bp} && cat {bb}/x"),
+        format!("pushd {bp}; ls {bb}"),
+        format!("cd {bp} && rm -rf ./{bb}"),
+        format!("cd {bp}; tar czf /tmp/x.tgz {bb}"),
+        format!("cd $D && ls {bb}"),
+        format!("cd {bp}/nope && rm -rf {bb}"),
+        format!("cd {bp} && cd {bb}/.. && cd {bb} && ls"),
+    ] {
+        asks_or_denies(ws, &cmd, &s.repo);
     }
     // Only the real baton is exempt in the board clone.
     for cmd in [

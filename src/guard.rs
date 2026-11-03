@@ -182,17 +182,39 @@ fn bash(t: &str, ctx: &Ctx, d: &mut Decision) {
     if words.as_deref().is_some_and(|w| real_baton(w, &ctx.cwd)) {
         return;
     }
-    if let Some(board) = &ctx.board
-        && (inside(&ctx.cwd, board) || names(t, board, &ctx.cwd))
-    {
-        d.deny(BOARD_WHY);
-    }
+    let loose = loose_words(t);
+    let (dirs, unresolved) = work_dirs(&loose, &ctx.cwd);
     let toks = tokens(t);
     let has = |w: &str| toks.iter().any(|t| t == w);
     let git = has("git");
+    // Does the command run in, or name, something inside `root`?
+    let hits = |root: &Path| {
+        dirs.iter().any(|d| inside(d, root))
+            || names(t, root)
+            || loose
+                .iter()
+                .flatten()
+                .any(|w| dirs.iter().any(|d| word_under(d, w, root)))
+    };
+    let roots = [ctx.board.as_deref(), ctx.notes.as_deref()];
+    if unresolved
+        && roots.iter().flatten().next().is_some()
+        && (git
+            || roots
+                .iter()
+                .flatten()
+                .any(|r| loose.iter().flatten().any(|w| could_name(w, r))))
+    {
+        d.ask("a directory change baton cannot resolve, near git or a baton repo");
+    }
+    if let Some(board) = &ctx.board
+        && hits(board)
+    {
+        d.deny(BOARD_WHY);
+    }
     if git
         && let Some(notes) = &ctx.notes
-        && (inside(&ctx.cwd, notes) || names(t, notes, &ctx.cwd))
+        && hits(notes)
     {
         notes_case(words.as_deref(), notes, ctx, d);
     }
@@ -252,13 +274,10 @@ fn notes_case(words: Option<&[String]>, notes: &Path, ctx: &Ctx, d: &mut Decisio
             NOTES_READS.join(", ")
         ));
     }
-    let mut paths = false;
+    // Every word that looks like an option asks unless allowlisted, also
+    // after `--` and after an option that takes a value.
     for a in args {
-        if paths || !a.starts_with('-') || a == "-" {
-            continue;
-        }
-        if a == "--" {
-            paths = true;
+        if !a.starts_with('-') || a == "-" || a == "--" {
             continue;
         }
         let name = a.split_once('=').map_or(a.as_str(), |(n, _)| n);
@@ -514,9 +533,8 @@ fn tokens(t: &str) -> Vec<String> {
     out
 }
 
-/// Does `t` name `root`: its path as text (raw, physical, `~/`, `$HOME/`)
-/// or a path-like token that resolves (symlinks too) under it?
-fn names(t: &str, root: &Path, cwd: &Path) -> bool {
+/// Does `t` name `root` as text (raw, physical, `~/`, `$HOME/`)?
+fn names(t: &str, root: &Path) -> bool {
     let mut forms = vec![root.to_path_buf(), physical(root)];
     if let Ok(home) = crate::config::home() {
         for f in forms.clone() {
@@ -528,15 +546,150 @@ fn names(t: &str, root: &Path, cwd: &Path) -> bool {
             }
         }
     }
-    if forms
+    forms
         .iter()
         .any(|f| t.contains(f.to_string_lossy().as_ref()))
-    {
-        return true;
+}
+
+/// Words of `t` for a loose scan, not a parse: quotes removed, a backslash
+/// keeps the next character, `None` between commands (`; & | ( )`, newline).
+fn loose_words(t: &str) -> Vec<Option<String>> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_word = false;
+    let mut quote: Option<char> = None;
+    let mut chars = t.chars();
+    let flush = |out: &mut Vec<Option<String>>, cur: &mut String, in_word: &mut bool| {
+        if *in_word {
+            out.push(Some(std::mem::take(cur)));
+            *in_word = false;
+        }
+    };
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some('"'), '\\') => cur.extend(chars.next()),
+            (Some(_), c) => cur.push(c),
+            (None, '\'' | '"') => {
+                quote = Some(c);
+                in_word = true;
+            }
+            (None, '\\') => {
+                in_word = true;
+                cur.extend(chars.next().filter(|&n| n != '\n'));
+            }
+            (None, ';' | '&' | '|' | '(' | ')' | '\n') => {
+                flush(&mut out, &mut cur, &mut in_word);
+                out.push(None);
+            }
+            (None, c) if c.is_whitespace() || c == '<' || c == '>' => {
+                flush(&mut out, &mut cur, &mut in_word);
+            }
+            (None, c) => {
+                cur.push(c);
+                in_word = true;
+            }
+        }
     }
-    t.split(|c: char| c.is_whitespace() || "'\";&|<>()`=,:".contains(c))
-        .filter(|w| w.contains('/') || w.starts_with('~') || w.starts_with('.'))
-        .any(|w| inside(&cwd.join(expand_home(w)), root))
+    flush(&mut out, &mut cur, &mut in_word);
+    out
+}
+
+const MAX_DIRS: usize = 64;
+
+/// Every directory a part of the command may run in: the cwd, then each
+/// target of `cd`/`pushd` and of `-C` (`git -C`, `env -C`) resolved against
+/// every directory found so far (so both cumulatively and on its own),
+/// physically and logically. `true` when a target cannot be resolved.
+fn work_dirs(words: &[Option<String>], cwd: &Path) -> (Vec<PathBuf>, bool) {
+    let mut dirs = vec![physical(cwd)];
+    let mut unresolved = false;
+    for (i, w) in words.iter().enumerate() {
+        // A `-C` only after `git` or `env` (elsewhere it is often a count,
+        // as in `grep -C 3` or `git diff -C`).
+        let after_git =
+            i > 0 && matches!(words[i - 1].as_deref(), Some("git" | "env" | "--no-pager"));
+        let target = match w.as_deref() {
+            Some("cd" | "pushd") => {
+                let mut j = i + 1;
+                while let Some(Some(o)) = words.get(j)
+                    && ["-P", "-L", "-e", "-@"].contains(&o.as_str())
+                {
+                    j += 1;
+                }
+                match words.get(j) {
+                    Some(Some(t)) => t.clone(),
+                    _ => "~".to_owned(),
+                }
+            }
+            Some("-C") if after_git => match words.get(i + 1) {
+                Some(Some(t)) => t.clone(),
+                _ => {
+                    unresolved = true;
+                    continue;
+                }
+            },
+            _ => continue,
+        };
+        let is_cd = w.as_deref() != Some("-C");
+        let target = expand_home(&target);
+        let text = target.to_string_lossy();
+        if text == "-" || text.starts_with('~') || text.contains(['$', '`', '*', '?', '[', '{']) {
+            unresolved = true;
+            continue;
+        }
+        for d in dirs.clone() {
+            let p = d.join(&target);
+            let real = physical(&p);
+            if is_cd && !real.is_dir() {
+                unresolved = true;
+            }
+            for c in [real, physical(&lexical(&p))] {
+                if !dirs.contains(&c) {
+                    dirs.push(c);
+                }
+            }
+        }
+        if dirs.len() > MAX_DIRS {
+            dirs.truncate(MAX_DIRS);
+            unresolved = true;
+        }
+    }
+    (dirs, unresolved)
+}
+
+/// Does word `w` (or its part after `=`, or any `:`-separated part), read
+/// as a path from `dir` (a physical directory), lead inside `root`?
+fn word_under(dir: &Path, w: &str, root: &Path) -> bool {
+    let real_root = physical(root);
+    let tail = w.split_once('=').map(|(_, v)| v);
+    std::iter::once(w)
+        .chain(tail)
+        .flat_map(|x| std::iter::once(x).chain(x.split(':')))
+        .filter(|x| {
+            !x.is_empty()
+                && (!x.contains(['$', '`']) || x.starts_with("$HOME/") || x.starts_with("${HOME}/"))
+        })
+        .any(|x| {
+            let x = expand_home(x);
+            let s = x.to_string_lossy();
+            if !s.contains('/') && s != "." && s != ".." {
+                // One component: one lookup.
+                let p = dir.join(&x);
+                return p.canonicalize().unwrap_or(p).starts_with(&real_root);
+            }
+            under(&dir.join(&x), root)
+        })
+}
+
+/// Could word `w` name `root` once some unknown directory is prepended
+/// (the last components of `root`, such as `board` or `baton/board`)?
+fn could_name(w: &str, root: &Path) -> bool {
+    let w = w.trim_end_matches('/');
+    !w.is_empty()
+        && !matches!(w, "." | "..")
+        && !w.contains('$')
+        && (root.ends_with(w) || physical(root).ends_with(w))
 }
 
 fn expand_home(w: &str) -> PathBuf {
@@ -618,14 +771,20 @@ fn lexical(path: &Path) -> PathBuf {
     out
 }
 
+/// Is `path` (absolute) inside `root`, physically or logically?
+fn under(path: &Path, root: &Path) -> bool {
+    let root = physical(root);
+    physical(path).starts_with(&root) || physical(&lexical(path)).starts_with(&root)
+}
+
 /// Is `path` (absolute) inside `root`, physically or logically, or in a
 /// linked worktree whose `.git` file points into `root`?
 fn inside(path: &Path, root: &Path) -> bool {
-    let root = physical(root);
-    let p = physical(path);
-    if p.starts_with(&root) || physical(&lexical(path)).starts_with(&root) {
+    if under(path, root) {
         return true;
     }
+    let root = physical(root);
+    let p = physical(path);
     let mut dir = Some(p.as_path());
     while let Some(d) = dir {
         let dotgit = d.join(".git");
