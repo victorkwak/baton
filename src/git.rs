@@ -197,34 +197,47 @@ impl Git {
         }
         let mut stdout = child.stdout.take().expect("piped stdout");
         let mut stderr = child.stderr.take().expect("piped stderr");
+        // Each reader signals when its pipe closes, which happens when git
+        // exits; waiting on that (with the timeout) costs no polling delay.
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let out_done = done_tx.clone();
         let out_t = std::thread::spawn(move || {
             let mut b = Vec::new();
             let _ = stdout.read_to_end(&mut b);
+            let _ = out_done.send(());
             b
         });
         let err_t = std::thread::spawn(move || {
             let mut b = Vec::new();
             let _ = stderr.read_to_end(&mut b);
+            let _ = done_tx.send(());
             b
         });
-        let start = Instant::now();
+        let deadline = Instant::now() + self.timeout;
+        let mut closed = 0;
         let status = loop {
-            if let Some(status) = child.try_wait()? {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if closed < 2 {
+                if done_rx.recv_timeout(left).is_ok() {
+                    closed += 1;
+                    continue;
+                }
+            } else if let Some(status) = child.try_wait()? {
                 break status;
+            } else if !left.is_zero() {
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
             }
-            if start.elapsed() > self.timeout {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(Error::new(
-                    Kind::Remote,
-                    format!(
-                        "git timed out after {}s in {}",
-                        self.timeout.as_secs(),
-                        self.dir.display()
-                    ),
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(20));
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(Error::new(
+                Kind::Remote,
+                format!(
+                    "git timed out after {}s in {}",
+                    self.timeout.as_secs(),
+                    self.dir.display()
+                ),
+            ));
         };
         let stdout = out_t.join().unwrap_or_default();
         let stderr = String::from_utf8_lossy(&err_t.join().unwrap_or_default()).into_owned();
