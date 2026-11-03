@@ -1213,6 +1213,8 @@ fn guard_never_silently_allows_known_bypass_shapes() {
     assert_eq!(decision(&run("cd notes; ls")), Some("ask"));
     assert_eq!(run("cd ./via-link && cargo test"), None);
     assert_eq!(run("cd src && cargo test"), None);
+    // A run-time setter without git near a baton repo stays silent.
+    assert_eq!(run("read -r x < f; echo \"$x\""), None);
     // Expansions are unknown: with git in the text they ask, from anywhere
     // (review 3).
     for cmd in [
@@ -1241,6 +1243,12 @@ fn guard_never_silently_allows_known_bypass_shapes() {
         "read -r GIT_DIR <<< \"$G\"; export GIT_DIR; git commit -m x",
         "HOME=$H; git -C $HOME/notes commit -m x",
         "export HOME=/tmp/x; cd ~/notes && git commit -m x",
+        // Run-time setters and bare exports; HOME named anywhere (review 6).
+        "read -r HOME < f; git -C $HOME/notes commit -m x",
+        "unset HOME; git -C ~/notes commit -m x",
+        "read -r GIT_DIR < f; export GIT_DIR; git commit -m x",
+        "mapfile -t A < f; GIT_DIR=${A[0]} git commit -m x",
+        "export -x GIT_WORK_TREE; git commit -m x",
     ] {
         asks_or_denies(ws, cmd, &s.repo);
     }

@@ -820,11 +820,43 @@ fn literal_heredoc(group: &str) -> bool {
 /// options before the subcommand, or a word that could name a baton repo.
 /// With `strict` (the cwd is in a baton repo), any expansion counts.
 fn located_expansion(words: &[Option<Loose>], roots: &[&Path], strict: bool) -> bool {
-    // A command that assigns HOME loses the `$HOME/…` exemption.
-    let home_reassigned = words
+    let all: Vec<&Loose> = words.iter().flatten().collect();
+    // A command that names HOME anywhere outside a `$HOME`/`${HOME}`
+    // expansion (an assignment, `read HOME`, `unset HOME`, a nameref) loses
+    // the `$HOME/…` and `~` exemptions.
+    let home_reassigned = all.iter().any(|w| {
+        w.text
+            .replace("${HOME}", "")
+            .replace("$HOME", "")
+            .contains("HOME")
+    });
+    // Builtins that set variables at run time (their words are not
+    // expansions, so the per-word rule below cannot see them), and a bare
+    // `export NAME` of a variable that decides where git acts.
+    let base = |w: &Loose| w.text.rsplit('/').next().unwrap_or(&w.text).to_owned();
+    let runtime_setter = all.iter().enumerate().any(|(i, w)| {
+        !w.dynamic
+            && (matches!(
+                base(w).as_str(),
+                "read" | "mapfile" | "readarray" | "getopts"
+            ) || (base(w) == "printf"
+                && all.get(i + 1).is_some_and(|n| n.text.starts_with("-v"))))
+    });
+    let location_name = |t: &str| {
+        (t.starts_with("GIT_") && !t.contains('='))
+            || matches!(t, "PWD" | "OLDPWD" | "CDPATH" | "HOME" | "XDG_CONFIG_HOME")
+    };
+    let bare_export = all.windows(2).any(|p| {
+        matches!(
+            base(p[0]).as_str(),
+            "export" | "declare" | "typeset" | "readonly" | "local"
+        ) && location_name(&p[1].text)
+    }) || all
         .iter()
-        .flatten()
-        .any(|w| w.text.contains("HOME=") || w.text.contains("HOME+="));
+        .any(|w| location_name(&w.text) && w.text != "HOME" && w.text.starts_with("GIT_"));
+    if runtime_setter || bare_export {
+        return true;
+    }
     const LOC_OPTS: &[&str] = &["-C", "--git-dir", "--work-tree", "--namespace"];
     const LOC_PREFIXES: &[&str] = &[
         "--git-dir=",
