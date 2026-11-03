@@ -1286,3 +1286,96 @@ fn the_waiter_rides_out_git_errors() {
     // Only wake lines on stderr: it goes to the model.
     assert_eq!(run.stderr.lines().count(), 1, "{}", run.stderr);
 }
+
+/// Is `pid` running (and not a zombie)?
+fn running(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|t| t.rfind(')').map(|i| t[i + 2..].starts_with('Z')))
+        .is_some_and(|zombie| !zombie)
+}
+
+#[test]
+fn a_waiter_whose_claude_code_is_gone_exits_without_waking() {
+    if !Path::new("/proc/self/stat").exists() {
+        eprintln!("skipped: needs /proc");
+        return;
+    }
+    let (_net, ws, laptop) = pair();
+    let plan = laptop.post("ws", "plan", &["--task", "t", "--plan"]);
+    as_session(&ws, &["take", &plan], None, "s");
+
+    // CLAUDE_PID names a stand-in Claude Code; it exits while the waiter waits.
+    let mut claude = Command::new("sleep").arg("60").spawn().unwrap();
+    let pid = claude.id().to_string();
+    let mut w = spawn_waiter(&ws, "s", None, &[("CLAUDE_PID", &pid)]);
+    still_running(&mut w, Duration::from_millis(1500));
+    claude.kill().unwrap();
+    claude.wait().unwrap();
+    let gone = Instant::now();
+    let run = finish(w, Duration::from_secs(10));
+    assert_eq!(run.code, 0, "{run:?}");
+    assert_eq!(run.stderr, "");
+    assert!(
+        gone.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        gone.elapsed()
+    );
+
+    // Without CLAUDE_PID: the parent process exits, the waiter (re-parented)
+    // notices and exits too.
+    let input = ws.root.join("stop.json");
+    std::fs::write(
+        &input,
+        json!({"session_id": "s", "cwd": "/", "hook_event_name": "Stop"}).to_string(),
+    )
+    .unwrap();
+    let sh = hook_cmd(&ws, &[], None, None);
+    let mut sh_cmd = Command::new("sh");
+    for (k, v) in sh.get_envs() {
+        match v {
+            Some(v) => sh_cmd.env(k, v),
+            None => sh_cmd.env_remove(k),
+        };
+    }
+    // (A short timeout, so a failing run leaves nothing behind for long.)
+    sh_cmd.env("BATON_HOOK_TIMEOUT_SECS", "20");
+    let out = sh_cmd
+        .args([
+            "-c",
+            r#""$0" hook wait <"$1" >/dev/null 2>&1 & echo $!; sleep 2"#,
+            env!("CARGO_BIN_EXE_baton"),
+            input.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let waiter: u32 = String::from_utf8(out.stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let start = Instant::now();
+    while running(waiter) {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the orphaned waiter is still running"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // A message waits; a waiter started for the dead Claude Code neither
+    // wakes nor moves the cursor.
+    let msg = laptop.post("ws", "for the session", &["--task", "t"]);
+    let run = finish(
+        spawn_waiter(&ws, "s", None, &[("CLAUDE_PID", &pid)]),
+        Duration::from_secs(10),
+    );
+    assert_eq!(run.code, 0, "{run:?}");
+    assert_eq!(run.stderr, "");
+
+    // The live session's next waiter wakes for the message: nothing above
+    // moved the cursor.
+    let run = finish(spawn_waiter(&ws, "s", None, &[]), Duration::from_secs(15));
+    assert_eq!(run.code, 2, "{run:?}");
+    assert_eq!(woken_ids(&run.stderr), vec![msg]);
+}

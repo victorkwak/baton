@@ -19,8 +19,8 @@ use crate::config::Config;
 use crate::error::Result;
 use crate::git::Git;
 use crate::hooks::{
-    Arming, GIT_BUILTINS, GitCall, Invocation, Loc, NOTES_READ_ONLY, Spec, hook_keys, invocations,
-    locate, parse_push, path_under, sessions_dir, unsafe_read_arg, write_atomic,
+    Arming, GIT_BUILTINS, GitCall, Invocation, Loc, NOTES_READ_ONLY, Parent, Spec, hook_keys,
+    invocations, locate, parse_push, path_under, sessions_dir, unsafe_read_arg, write_atomic,
 };
 use crate::output::field;
 use crate::record::{MsgKind, random_u64};
@@ -232,6 +232,7 @@ fn unix_now() -> i64 {
 /// line on stderr.
 fn wait() -> Result<()> {
     let start = Instant::now();
+    let parent = Parent::at_start();
     let total = env_secs("BATON_HOOK_TIMEOUT_SECS", 3600);
     let margin = env_secs("BATON_HOOK_MARGIN_SECS", 60);
     let deadline = start + total.saturating_sub(margin);
@@ -250,7 +251,8 @@ fn wait() -> Result<()> {
     // session exits, then take the session's lock from it.
     let generation = Generation::new();
     generation.write(&dir, &primary)?;
-    let newest = || generation.current(&dir, &primary);
+    // Keep waiting while this is the newest waiter and Claude Code is there.
+    let newest = || parent.alive() && generation.current(&dir, &primary);
     let lock = File::options()
         .create(true)
         .truncate(false)
@@ -355,7 +357,9 @@ fn wait() -> Result<()> {
             .filter(|m| wakes(m, &arming, &config.machine))
             .collect();
         if !newest() {
-            // A newer waiter owns the session now; it finds the same records.
+            // A newer waiter owns the session now (it finds the same
+            // records), or Claude Code is gone: exit without moving the
+            // cursor or waking.
             return Ok(());
         }
         let now = unix_now();
@@ -382,6 +386,9 @@ fn wait() -> Result<()> {
                         human = field(&config.human),
                     ));
                     ws.last_wake.insert(wake_key(m), now);
+                }
+                if !newest() {
+                    return Ok(());
                 }
                 ws.cursor = Some(snap.remote_len);
                 ws.save(&dir, &keys)?;

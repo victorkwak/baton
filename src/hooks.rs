@@ -128,6 +128,57 @@ impl Arming {
     }
 }
 
+/// The Claude Code process a hook belongs to. A waiter whose Claude Code
+/// is gone must exit and never wake (or move its cursor): nobody would
+/// read the wake.
+#[derive(Debug, Clone)]
+pub struct Parent {
+    /// `CLAUDE_PID` from the environment, when Claude Code sets it.
+    claude: Option<u32>,
+    /// The parent pid at start.
+    ppid: u32,
+}
+
+impl Parent {
+    pub fn at_start() -> Parent {
+        Parent {
+            claude: std::env::var("CLAUDE_PID")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .filter(|&p| p > 1),
+            ppid: std::os::unix::process::parent_id(),
+        }
+    }
+
+    /// Still there: the parent pid has not changed (a dead parent's
+    /// children are re-parented), and `CLAUDE_PID`, if known, is alive.
+    pub fn alive(&self) -> bool {
+        std::os::unix::process::parent_id() == self.ppid && self.claude.is_none_or(pid_alive)
+    }
+}
+
+/// Is process `pid` running (not a zombie)? `/proc` where there is one,
+/// else `kill -0`.
+fn pid_alive(pid: u32) -> bool {
+    if Path::new("/proc/self/stat").exists() {
+        // `<pid> (<comm>) <state> ...`; comm may hold spaces and parens.
+        return std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|t| {
+                t.rfind(')')
+                    .and_then(|i| t[i + 1..].trim_start().chars().next())
+            })
+            .is_some_and(|state| !matches!(state, 'Z' | 'X' | 'x'));
+    }
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_or(true, |s| s.success())
+}
+
 /// Write `contents` to `path` atomically (temp file + rename).
 pub fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
