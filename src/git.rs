@@ -16,6 +16,15 @@ use crate::error::{Error, Kind, Result};
 /// Default limit for one git call.
 pub const TIMEOUT: Duration = Duration::from_secs(60);
 
+/// [`TIMEOUT`], or `BATON_GIT_TIMEOUT_SECS` (tests).
+fn default_timeout() -> Duration {
+    std::env::var("BATON_GIT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .map_or(TIMEOUT, Duration::from_secs)
+}
+
 /// A git invocation in one repository.
 #[derive(Debug, Clone)]
 pub struct Git {
@@ -133,7 +142,7 @@ impl Git {
         Self {
             dir: dir.into(),
             env: Vec::new(),
-            timeout: TIMEOUT,
+            timeout: default_timeout(),
         }
     }
 
@@ -230,8 +239,15 @@ impl Git {
             }
             let _ = child.kill();
             let _ = child.wait();
+            // Only a call that talks to a remote can time out on the
+            // network; a slow local call is an internal problem.
+            let kind = if talks_to_remote(&cmd) {
+                Kind::Remote
+            } else {
+                Kind::Internal
+            };
             return Err(Error::new(
-                Kind::Remote,
+                kind,
                 format!(
                     "git timed out after {}s in {}",
                     self.timeout.as_secs(),
@@ -269,6 +285,33 @@ impl Git {
     }
 }
 
+/// Git subcommands that reach a remote.
+const REMOTE_SUBCOMMANDS: &[&str] = &[
+    "fetch",
+    "push",
+    "pull",
+    "ls-remote",
+    "clone",
+    "remote",
+    "archive",
+];
+
+/// Does this git command line reach a remote? Its subcommand is the first
+/// argument after `-C <dir>`, `-c <k=v>` and other options.
+fn talks_to_remote(cmd: &Command) -> bool {
+    let mut args = cmd.get_args().map(|a| a.to_string_lossy());
+    while let Some(a) = args.next() {
+        match a.as_ref() {
+            "-C" | "-c" => {
+                args.next();
+            }
+            a if a.starts_with('-') => {}
+            sub => return REMOTE_SUBCOMMANDS.contains(&sub),
+        }
+    }
+    false
+}
+
 /// Turn a failed git call's stderr into a typed error.
 pub fn classify(what: &str, stderr: &str) -> Error {
     let first = stderr
@@ -282,6 +325,7 @@ pub fn classify(what: &str, stderr: &str) -> Error {
         || s.contains("incorrect passphrase")
         || s.contains("host key verification failed")
         || s.contains("authentication failed")
+        || refused_by_permissions(&s)
     {
         Kind::Auth
     } else if s.contains("could not resolve hostname")
@@ -298,6 +342,7 @@ pub fn classify(what: &str, stderr: &str) -> Error {
     } else if s.contains("remote:")
         || s.contains("internal server error")
         || s.contains("[rejected]")
+        || s.contains("[remote rejected]")
     {
         Kind::Remote
     } else {
@@ -310,6 +355,28 @@ pub fn classify(what: &str, stderr: &str) -> Error {
         _ => "git",
     };
     Error::new(kind, format!("{label}: git {what}: {first}"))
+}
+
+/// The remote refused for lack of permission (the key works, but may not
+/// write here). Checked before the offline patterns: hosts follow it with
+/// "Could not read from remote repository". `s` is lowercase.
+fn refused_by_permissions(s: &str) -> bool {
+    s.contains(" denied to ")
+        || s.contains("permission to ")
+        || s.contains("access denied")
+        || s.contains("not allowed to push")
+        || s.contains("marked as read only")
+        || s.contains("[remote rejected]")
+            && [
+                "permission",
+                "denied",
+                "not allowed",
+                "forbidden",
+                "read only",
+                "read-only",
+            ]
+            .iter()
+            .any(|w| s.contains(w))
 }
 
 #[cfg(test)]
@@ -331,6 +398,49 @@ mod tests {
             Kind::Remote
         );
         assert_eq!(classify("log", "fatal: bad revision").kind, Kind::Internal);
+    }
+
+    #[test]
+    fn a_timeout_is_remote_only_for_calls_that_reach_a_remote() {
+        let tmp = tempfile::tempdir().unwrap();
+        let git = Git::new(tmp.path()).with_timeout(Duration::from_millis(500));
+        assert!(git.output(["init", "-q"]).unwrap().ok());
+        // A slow local call (an alias running a shell command).
+        let e = git
+            .output(["-c", "alias.slow=!sleep 3", "slow"])
+            .unwrap_err();
+        assert_eq!(e.kind, Kind::Internal, "{e}");
+        // A fetch from a remote that never answers.
+        let e = git
+            .output(["-c", "protocol.ext.allow=always", "fetch", "ext::sleep 3"])
+            .unwrap_err();
+        assert_eq!(e.kind, Kind::Remote, "{e}");
+    }
+
+    #[test]
+    fn permission_refusals_are_auth_not_offline() {
+        for stderr in [
+            // GitHub, SSH key without write access.
+            "ERROR: Permission to me/board.git denied to other-user.\nfatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights\nand the repository exists.",
+            // GitHub, read-only deploy key.
+            "ERROR: The key you are authenticating with has been marked as read only.\nfatal: Could not read from remote repository.",
+            // GitLab, protected branch.
+            "remote: GitLab: You are not allowed to push code to protected branches on this project.\nTo example.com:me/board.git\n ! [remote rejected] main -> main (pre-receive hook declined)",
+            // HTTPS.
+            "remote: Access denied\nfatal: unable to access 'https://example.com/board.git/': The requested URL returned error: 403",
+            " ! [remote rejected] main -> main (permission denied)",
+        ] {
+            assert_eq!(classify("push", stderr).kind, Kind::Auth, "{stderr}");
+        }
+        // A race is still a race, and a plain remote error stays remote.
+        assert_eq!(
+            classify(
+                "push",
+                " ! [remote rejected] main -> main (pre-receive hook declined)"
+            )
+            .kind,
+            Kind::Remote
+        );
     }
 
     #[test]

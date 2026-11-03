@@ -585,6 +585,7 @@ fn check_board(r: &mut Report, config: &Config) {
         },
         Err(e) => r.add(Status::Fail, "board-remote", e.message),
     }
+    check_queue(r, config);
     // Locks and leftovers.
     let mut notes = Vec::new();
     if lock_held(&clone.join(".git/baton.lock")) == Some(true) {
@@ -658,6 +659,46 @@ fn check_notes(r: &mut Report, config: &Config) {
         );
     } else {
         r.add(Status::Ok, "notes-lock", "free");
+    }
+}
+
+/// Posts queued on local `main`: try to push them, report what is left.
+/// Skipped (no line) while another baton holds the board lock.
+fn check_queue(r: &mut Report, config: &Config) {
+    let Ok(store) = Store::open(config, "") else {
+        return;
+    };
+    let lock = store.path().join(".git/baton.lock");
+    if lock_held(&lock) == Some(true) {
+        return;
+    }
+    let Ok(_l) = store.lock() else { return };
+    let before = match store.read() {
+        Ok(s) => s.queued,
+        Err(e) => return r.add(Status::Fail, "board-queue", e.message),
+    };
+    if before == 0 {
+        return r.add(Status::Ok, "board-queue", "no queued posts");
+    }
+    match store.deliver_queued() {
+        Ok(0) => r.add(
+            Status::Ok,
+            "board-queue",
+            format!("pushed {before} queued commit(s)"),
+        ),
+        Ok(n) => r.add(
+            Status::Fail,
+            "board-queue",
+            format!("{n} commit(s) still queued locally"),
+        ),
+        Err(e) => r.add(
+            Status::Fail,
+            "board-queue",
+            format!(
+                "{before} commit(s) queued locally, not pushed: {}",
+                e.message
+            ),
+        ),
     }
 }
 

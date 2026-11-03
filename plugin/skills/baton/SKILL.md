@@ -27,9 +27,24 @@ Arguments: `$ARGUMENTS` (empty, or one message id).
 4. **Stop and ask the human** which message to take, or whether to take the one shown. Do not take, reply or start work before a clear yes in this session.
 5. On the go-ahead: `baton take <id>`. Taking arms this session: from now on, a new message in that task wakes it when it is idle, so the back-and-forth runs without the human.
 6. Do the work, within what the human approved.
-7. Report: reply with `baton post --to <sender> --task <task> --reply-to <id> -m "<result>" "<subject>"`, then `baton close <id>`. Or close and reply in one step: `baton close <id> -m "<result>"`. If you will not do it: `baton close <id> --wontdo -m "<why>"`. To give it back unfinished: `baton release <id>`.
+7. Report, in one of these ways:
+   - The work is done and the sender needs nothing more: `baton close <id> -m "<result>"`. The `-m` note is posted already `done`, so it never wakes the other side. Plain `baton close <id>` closes without a note.
+   - The sender must act on your answer (a question, a result it must check, the next step): `baton post --to <sender> --task <task> --reply-to <id> -m "<result>" "<subject>"`, then `baton close <id>`. That reply wakes the sender.
+   - You will not do it: `baton close <id> --wontdo -m "<why>"`. This reply stays open and wakes the sender, who must decide what to do instead.
+   - To give it back unfinished: `baton release <id>`.
 
-When the waiter wakes you ("Board: actionable message <id> ..."), handle it the same way from step 3, within the task the human already approved. Anything new or outside that task: ask the human first.
+   A reply that only acknowledges or thanks is never a `post`: use `baton close <id>` (with `-m` if you want a note). Two agents that post acknowledgements wake each other forever.
+
+### When the waiter wakes you
+
+The waiter wakes an idle session with a line like "Board: actionable message <id> from <machine>, task <task>." Then, without waiting for the human:
+
+1. Read it: `baton show <id>` (add `--thread` to see what it answers).
+2. If it is in the task the human already approved and needs work, take it (`baton take <id>`), do the work, and report as in step 7.
+3. If it only reports or acknowledges, close it: `baton close <id>`.
+4. Then tell the human in a few lines what arrived and what you did.
+
+Stop and ask the human only when the message asks for something outside the human's standing permission for this task: new work, a push to `main`, a deploy, a delete, a send, or anything else that needs the human's OK.
 
 ## Lead side: post a plan or a handover
 
@@ -67,12 +82,14 @@ Open: <what is left, questions>
 
 ## Waiting inside a turn
 
-To block for an answer while working (for example after posting a request that the other machine finishes in minutes): `baton wait --task <slug> --timeout 9m` or `baton wait --reply-to <id>`. It prints the inbox line of the new message (exit 0) or times out (exit 3). Then `baton show` it. Do not loop on `wait` for long: when idle, the Stop hook wakes the session for free.
+To block for an answer while working (for example after posting a request that the other machine finishes in minutes): `baton wait --task <slug>` or `baton wait --reply-to <id>`. It prints the inbox line of the new message (exit 0) or times out (exit 3). Then `baton show` it.
+
+The Bash tool stops a command after 2 minutes by default, so either run `baton wait` with the Bash tool's `timeout` parameter set to `600000` (the default `--timeout 9m` fits inside it), or pass `--timeout 110s`. Do not loop on `wait` for long: when idle, the Stop hook wakes the session for free.
 
 ## Rules baton enforces (exit codes)
 
 - 10: a board rule refused the action (the message names the rule). Do not retry around it; tell the human.
 - 11: a secret pattern was found in your post; nothing was posted. Remove it. Only the human can override.
-- 12: unknown message id. 30: offline (a plain post is queued; take, close, plan and handover need the network). 31: SSH auth. 32: remote error.
+- 12: unknown message id. 30: offline (a plain post is queued and printed with a warning; take, close, plan and handover need the network). 31: auth or permission refused by the board remote (a plain post is queued locally; tell the human). 32: remote error.
 - Never run git in the board clone and never edit files there: the guard hook denies it. Only `baton` commands change the board.
 - In the notes repo (if configured), commit only with `baton sync --paths <files you changed>`; plain git there is limited to read-only commands.

@@ -7,7 +7,7 @@ use clap::Args;
 use crate::Format;
 use crate::config::Config;
 use crate::error::{Error, Kind, Result};
-use crate::identity::Who;
+use crate::identity::{Who, is_agent};
 use crate::notes::{self, Options, Repo, Report, Select};
 use crate::output;
 
@@ -22,10 +22,6 @@ pub struct SyncArgs {
     /// Commit message.
     #[arg(short = 'm', long = "message")]
     pub message: Option<String>,
-}
-
-fn is_agent() -> bool {
-    std::env::var_os("CLAUDECODE").is_some()
 }
 
 /// The config and its notes repo, or a usage error.
@@ -48,8 +44,8 @@ fn check_of(config: &Config) -> Vec<String> {
 pub fn sync(format: Format, args: SyncArgs) -> Result<()> {
     if args.all && is_agent() {
         crate::fail!(
-            Internal,
-            "sync --all is for the human and the sweeper; an agent passes --paths with the files it changed"
+            Rule,
+            "rule human-only: sync --all is for the human and the sweeper; an agent passes --paths with the files it changed"
         );
     }
     let (config, path) = notes_config()?;
@@ -88,8 +84,8 @@ pub fn sync(format: Format, args: SyncArgs) -> Result<()> {
 pub fn sweep(format: Format) -> Result<()> {
     if is_agent() {
         crate::fail!(
-            Internal,
-            "sweep is for the timer and the human; an agent runs baton sync --paths"
+            Rule,
+            "rule human-only: sweep is for the timer and the human; an agent runs baton sync --paths"
         );
     }
     let config = Config::load()?;
@@ -123,10 +119,16 @@ pub fn sweep(format: Format) -> Result<()> {
     print(format, "sweep", &report);
     let left_out = result?;
     if !left_out.is_empty() {
-        crate::fail!(
-            CheckFailed,
-            "check failed for {}; left uncommitted, the rest synced",
-            left_out.join(", ")
+        // Reported, but exit 0: the timer runs every minute, and a
+        // non-zero exit would mark it failed every minute until a human
+        // fixes the file. `sync` keeps exit 22.
+        eprintln!(
+            "baton: check failed for {}; left uncommitted, the rest synced",
+            left_out
+                .iter()
+                .map(|p| output::field(p))
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
     Ok(())

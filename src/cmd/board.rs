@@ -208,11 +208,25 @@ fn warn_rejected(state: &State) {
     }
 }
 
+/// Fetch and read; when posts are queued and the remote was reached, try
+/// to push them (quietly) first. Warns on stderr while any stay queued.
+fn fetch_read_deliver(store: &Store) -> Result<crate::store::Snapshot> {
+    let online = store.fetch_or_warn()?;
+    let mut snap = store.read()?;
+    if snap.queued > 0 && online {
+        store.deliver_queued_quietly();
+        snap = store.read()?;
+    }
+    if let Some(w) = crate::store::queued_warning(snap.queued) {
+        eprintln!("{w}");
+    }
+    Ok(snap)
+}
+
 pub fn inbox(format: Format, args: InboxArgs) -> Result<()> {
     let c = ctx()?;
     let _lock = c.store.lock()?;
-    c.store.fetch_or_warn()?;
-    let snap = c.store.read()?;
+    let snap = fetch_read_deliver(&c.store)?;
     warn_rejected(&snap.state);
     let msgs = snap.state.inbox(c.who.machine(), args.all);
     print_messages(format, "inbox", &msgs);
@@ -462,6 +476,12 @@ fn close_with(format: Format, c: &Ctx, args: CloseArgs) -> Result<()> {
     let _lock = c.store.lock()?;
     let ev = status_event(&c.who, &id, status);
     let reply_id = new_id();
+    // With `done`, the reply is a note, not a request: it is posted already
+    // `done`, so it never wakes the other side (no ping-pong of closing
+    // notes). A `wontdo` reply stays open: the sender must decide what to
+    // do with refused work. A reply to the human stays open: only the
+    // human closes those.
+    let reply_done = status_event(&c.who, &reply_id, Status::Done);
     let at = now();
     let w = c
         .store
@@ -486,7 +506,11 @@ fn close_with(format: Format, c: &Ctx, args: CloseArgs) -> Result<()> {
                     body: text.clone(),
                 };
                 reply.validate()?;
+                let to_human = reply.to == c.config.human;
                 recs.push(Record::Message(reply));
+                if status == Status::Done && !to_human {
+                    recs.push(reply_done.clone());
+                }
             }
             Ok(recs)
         })?;
@@ -594,8 +618,7 @@ pub fn wait(format: Format, args: WaitArgs) -> Result<()> {
 pub fn tasks(format: Format) -> Result<()> {
     let c = ctx()?;
     let _lock = c.store.lock()?;
-    c.store.fetch_or_warn()?;
-    let snap = c.store.read()?;
+    let snap = fetch_read_deliver(&c.store)?;
     warn_rejected(&snap.state);
     let now = jiff::Timestamp::now();
     let rows = snap.state.task_summaries(now);
@@ -650,7 +673,7 @@ pub fn tasks(format: Format) -> Result<()> {
 }
 
 pub fn human(format: Format, cmd: HumanCommand) -> Result<()> {
-    if std::env::var_os("CLAUDECODE").is_some() || !std::io::stdin().is_terminal() {
+    if crate::identity::is_agent() || !std::io::stdin().is_terminal() {
         crate::fail!(
             Rule,
             "rule human-only: `baton human` is for the human at a terminal; refused inside Claude Code or without a TTY"

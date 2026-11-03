@@ -240,7 +240,7 @@ fn wait_finds_a_message_that_arrived_between_waiters() {
 }
 
 #[test]
-fn wait_exits_at_once_when_unarmed_or_already_waiting() {
+fn wait_exits_at_once_when_unarmed() {
     let (_net, ws, laptop) = pair();
     // Unarmed: nothing posted, taken or replied by this session.
     laptop.post("ws", "plan", &["--task", "t", "--plan"]);
@@ -251,17 +251,49 @@ fn wait_exits_at_once_when_unarmed_or_already_waiting() {
     );
     assert_eq!(run.code, 0, "{run:?}");
     assert!(start.elapsed() < Duration::from_secs(5));
+}
 
-    // A second waiter for the same session exits 0 while the first waits.
-    let plan = ws.inbox_ids(false);
-    as_session(&ws, &["take", &plan[0]], None, "s");
-    let mut first = spawn_waiter(&ws, "s", None, &[]);
-    still_running(&mut first, Duration::from_millis(1000));
-    let run = finish(spawn_waiter(&ws, "s", None, &[]), Duration::from_secs(10));
+#[test]
+fn the_newest_waiter_takes_over_the_session() {
+    let (_net, ws, laptop) = pair();
+    let plan = laptop.post("ws", "plan", &["--task", "t", "--plan"]);
+    as_session(&ws, &["take", &plan], None, "s");
+    // First Stop: a waiter whose deadline comes in 5 s.
+    let short = [
+        ("BATON_HOOK_TIMEOUT_SECS", "6"),
+        ("BATON_HOOK_MARGIN_SECS", "1"),
+    ];
+    let first_started = Instant::now();
+    let mut first = spawn_waiter(&ws, "s", None, &short);
+    still_running(&mut first, Duration::from_millis(1500));
+
+    // Second Stop: the new waiter takes over; the first exits 0 promptly.
+    let second = spawn_waiter(
+        &ws,
+        "s",
+        None,
+        &[
+            ("BATON_HOOK_TIMEOUT_SECS", "30"),
+            ("BATON_HOOK_MARGIN_SECS", "1"),
+        ],
+    );
+    let yielded = Instant::now();
+    let run = finish(first, Duration::from_secs(10));
     assert_eq!(run.code, 0, "{run:?}");
-    still_running(&mut first, Duration::from_millis(100));
-    first.kill().unwrap();
-    let _ = first.wait();
+    assert_eq!(run.stderr, "");
+    assert!(
+        yielded.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        yielded.elapsed()
+    );
+
+    // A message after the first waiter's deadline still wakes the session.
+    let past = Duration::from_millis(5500).saturating_sub(first_started.elapsed());
+    std::thread::sleep(past);
+    let msg = laptop.post("ws", "late", &["--task", "t"]);
+    let run = finish(second, Duration::from_secs(15));
+    assert_eq!(run.code, 2, "{run:?}");
+    assert_eq!(woken_ids(&run.stderr), vec![msg]);
 }
 
 #[test]
@@ -381,6 +413,67 @@ fn a_reply_to_an_armed_message_without_a_task_wakes() {
         "{}",
         run.stderr
     );
+}
+
+#[test]
+fn closing_with_a_note_never_wakes_the_other_side() {
+    let (_net, ws, laptop) = pair();
+    let gap = [("BATON_WAKE_GAP_SECS", "0")];
+    let plan = as_session(
+        &ws,
+        &[
+            "post", "--to", "laptop", "--task", "t", "--plan", "-m", "p", "plan",
+        ],
+        None,
+        "ws-s",
+    );
+    as_session(&laptop, &["take", &plan], None, "lap-s");
+    let mut ws_w = spawn_waiter(&ws, "ws-s", None, &gap);
+    let lap_w = spawn_waiter(&laptop, "lap-s", None, &gap);
+
+    // Round 1: ws asks; laptop wakes.
+    let req = as_session(
+        &ws,
+        &["post", "--to", "laptop", "--task", "t", "-m", "x", "do it"],
+        None,
+        "ws-s",
+    );
+    let run = finish(lap_w, Duration::from_secs(15));
+    assert_eq!(woken_ids(&run.stderr), vec![req.clone()], "{run:?}");
+
+    // Round 2: laptop closes it with a note. ws stays asleep, and the note
+    // is not in ws's inbox.
+    let lap_w = spawn_waiter(&laptop, "lap-s", None, &gap);
+    as_session(
+        &laptop,
+        &["close", &req, "-m", "done, sha abc"],
+        None,
+        "lap-s",
+    );
+    still_running(&mut ws_w, Duration::from_millis(3000));
+    assert!(ws.inbox_ids(false).is_empty());
+
+    // Round 3: laptop asks back; ws wakes for that only, and closes it
+    // with a note, which does not wake laptop either.
+    let q = as_session(
+        &laptop,
+        &["post", "--to", "ws", "--task", "t", "-m", "?", "question"],
+        None,
+        "lap-s",
+    );
+    let run = finish(ws_w, Duration::from_secs(15));
+    assert_eq!(woken_ids(&run.stderr), vec![q.clone()], "{run:?}");
+    let mut lap_w = lap_w;
+    as_session(&ws, &["close", &q, "-m", "answered"], None, "ws-s");
+    still_running(&mut lap_w, Duration::from_millis(3000));
+    let next = as_session(
+        &ws,
+        &["post", "--to", "laptop", "--task", "t", "-m", "x", "next"],
+        None,
+        "ws-s",
+    );
+    let run = finish(lap_w, Duration::from_secs(15));
+    assert_eq!(woken_ids(&run.stderr), vec![next], "{run:?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -1220,4 +1313,175 @@ fn guard_never_silently_allows_known_bypass_shapes() {
     ] {
         asks_or_denies(laptop, cmd, &s.repo);
     }
+}
+
+#[test]
+fn the_waiter_rides_out_git_errors() {
+    let (net, ws, laptop) = pair();
+    let plan = laptop.post("ws", "plan", &["--task", "t", "--plan"]);
+    as_session(&ws, &["take", &plan], None, "s");
+    let mut w = spawn_waiter(&ws, "s", None, &[]);
+    still_running(&mut w, Duration::from_millis(1500));
+    // The board remote disappears for a while (every git call fails as
+    // "not a git repository": not offline), then comes back.
+    let away = net.dir.path().join("board-away.git");
+    std::fs::rename(&net.bare, &away).unwrap();
+    still_running(&mut w, Duration::from_millis(3000));
+    std::fs::rename(&away, &net.bare).unwrap();
+    let msg = laptop.post("ws", "after the outage", &["--task", "t"]);
+    let run = finish(w, Duration::from_secs(30));
+    assert_eq!(run.code, 2, "{run:?}");
+    assert_eq!(woken_ids(&run.stderr), vec![msg]);
+    // Only wake lines on stderr: it goes to the model.
+    assert_eq!(run.stderr.lines().count(), 1, "{}", run.stderr);
+}
+
+/// Is `pid` running (and not a zombie)?
+fn running(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|t| t.rfind(')').map(|i| t[i + 2..].starts_with('Z')))
+        .is_some_and(|zombie| !zombie)
+}
+
+#[test]
+fn a_waiter_whose_claude_code_is_gone_exits_without_waking() {
+    if !Path::new("/proc/self/stat").exists() {
+        eprintln!("skipped: needs /proc");
+        return;
+    }
+    let (_net, ws, laptop) = pair();
+    let plan = laptop.post("ws", "plan", &["--task", "t", "--plan"]);
+    as_session(&ws, &["take", &plan], None, "s");
+
+    // CLAUDE_PID names a stand-in Claude Code; it exits while the waiter waits.
+    let mut claude = Command::new("sleep").arg("60").spawn().unwrap();
+    let pid = claude.id().to_string();
+    let mut w = spawn_waiter(&ws, "s", None, &[("CLAUDE_PID", &pid)]);
+    still_running(&mut w, Duration::from_millis(1500));
+    claude.kill().unwrap();
+    claude.wait().unwrap();
+    let gone = Instant::now();
+    let run = finish(w, Duration::from_secs(10));
+    assert_eq!(run.code, 0, "{run:?}");
+    assert_eq!(run.stderr, "");
+    assert!(
+        gone.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        gone.elapsed()
+    );
+
+    // Without CLAUDE_PID: the parent process exits, the waiter (re-parented)
+    // notices and exits too.
+    let input = ws.root.join("stop.json");
+    std::fs::write(
+        &input,
+        json!({"session_id": "s", "cwd": "/", "hook_event_name": "Stop"}).to_string(),
+    )
+    .unwrap();
+    let sh = hook_cmd(&ws, &[], None, None);
+    let mut sh_cmd = Command::new("sh");
+    for (k, v) in sh.get_envs() {
+        match v {
+            Some(v) => sh_cmd.env(k, v),
+            None => sh_cmd.env_remove(k),
+        };
+    }
+    // (A short timeout, so a failing run leaves nothing behind for long.)
+    sh_cmd.env("BATON_HOOK_TIMEOUT_SECS", "20");
+    let out = sh_cmd
+        .args([
+            "-c",
+            r#""$0" hook wait <"$1" >/dev/null 2>&1 & echo $!; sleep 2"#,
+            env!("CARGO_BIN_EXE_baton"),
+            input.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let waiter: u32 = String::from_utf8(out.stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let start = Instant::now();
+    while running(waiter) {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the orphaned waiter is still running"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // A message waits; a waiter started for the dead Claude Code neither
+    // wakes nor moves the cursor.
+    let msg = laptop.post("ws", "for the session", &["--task", "t"]);
+    let run = finish(
+        spawn_waiter(&ws, "s", None, &[("CLAUDE_PID", &pid)]),
+        Duration::from_secs(10),
+    );
+    assert_eq!(run.code, 0, "{run:?}");
+    assert_eq!(run.stderr, "");
+
+    // The live session's next waiter wakes for the message: nothing above
+    // moved the cursor.
+    let run = finish(spawn_waiter(&ws, "s", None, &[]), Duration::from_secs(15));
+    assert_eq!(run.code, 2, "{run:?}");
+    assert_eq!(woken_ids(&run.stderr), vec![msg]);
+}
+
+#[test]
+fn arming_for_a_message_without_a_task_ends_and_old_files_are_pruned() {
+    let (_net, ws, laptop) = pair();
+    let q = as_session(
+        &ws,
+        &["post", "--to", "laptop", "-m", "?", "question"],
+        None,
+        "s",
+    );
+    let mut w = spawn_waiter(&ws, "s", None, &[]);
+    still_running(&mut w, Duration::from_millis(1500));
+    // The question is closed: nothing is left to wait for.
+    laptop.run(&["close", &q]).ok();
+    let run = finish(w, Duration::from_secs(15));
+    assert_eq!(run.code, 0, "{run:?}");
+    assert_eq!(run.stderr, "");
+
+    // A question armed more than 7 days ago no longer holds a waiter.
+    let q2 = as_session(
+        &ws,
+        &["post", "--to", "laptop", "-m", "?", "old question"],
+        None,
+        "s2",
+    );
+    let sessions = ws.root.join("state/sessions");
+    let path = sessions.join("s2.json");
+    let mut arming: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let old = jiff_like_now() - 8 * 24 * 3600;
+    arming["armed_at"][&q2] = json!(old);
+    std::fs::write(&path, arming.to_string()).unwrap();
+    let run = finish(spawn_waiter(&ws, "s2", None, &[]), Duration::from_secs(10));
+    assert_eq!(run.code, 0, "{run:?}");
+
+    // Session files not written for 7 days are pruned by the next arming.
+    let stale = sessions.join("gone.json");
+    std::fs::write(&stale, "{}").unwrap();
+    let f = std::fs::File::options().write(true).open(&stale).unwrap();
+    f.set_modified(std::time::SystemTime::now() - Duration::from_secs(8 * 24 * 3600))
+        .unwrap();
+    drop(f);
+    as_session(
+        &ws,
+        &["post", "--to", "laptop", "-m", "x", "another"],
+        None,
+        "s3",
+    );
+    assert!(!stale.exists());
+    assert!(sessions.join("s3.json").exists());
+}
+
+fn jiff_like_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
 }

@@ -369,6 +369,99 @@ fn an_agent_cannot_close_a_message_to_the_human() {
     plain.run(&["human", "close", &id]).code(10);
 }
 
+/// Run `baton <args>` with a pseudo-terminal on stdin (through `script`),
+/// with `m`'s environment plus `env`. `None` when `script` is missing.
+fn on_tty(m: &Machine, env: &[(&str, &str)], args: &str) -> Option<(i32, String)> {
+    let exe = env!("CARGO_BIN_EXE_baton");
+    let cmd = m.command(&[]);
+    let mut c = std::process::Command::new("script");
+    c.args(["-qec", &format!("{exe} {args}"), "/dev/null"]);
+    for (k, v) in cmd.get_envs() {
+        match v {
+            Some(v) => c.env(k, v),
+            None => c.env_remove(k),
+        };
+    }
+    for (k, v) in env {
+        c.env(k, v);
+    }
+    let out = c.output().ok()?;
+    Some((
+        out.status.code().unwrap(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    ))
+}
+
+/// The `from` and `session` of a message, read on the remote by `laptop`.
+fn from_and_session(laptop: &Machine, id: &str) -> (String, String) {
+    let v = laptop.run(&["--format", "json", "show", id]).json();
+    let item = &v["items"][0];
+    (
+        item["from"].as_str().unwrap().to_owned(),
+        item["session"].as_str().unwrap().to_owned(),
+    )
+}
+
+#[test]
+fn identity_agent_ide_terminal_and_script() {
+    if std::process::Command::new("script")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipped: no `script` to provide a TTY");
+        return;
+    }
+    let (_net, ws, laptop) = pair();
+    let mut plain = ws.clone();
+    plain.agent = false;
+    let post = |env: &[(&str, &str)], subject: &str| {
+        let (code, out) =
+            on_tty(&plain, env, &format!("post --to laptop -m body {subject}")).unwrap();
+        assert_eq!(code, 0, "{out}");
+        out.trim().to_owned()
+    };
+
+    // A Claude Code tool process: CLAUDE_CODE_CHILD_SESSION, even with a TTY.
+    let id = post(
+        &[
+            ("CLAUDECODE", "1"),
+            ("CLAUDE_CODE_CHILD_SESSION", "1"),
+            ("CLAUDE_CODE_SESSION_ID", "agent-s"),
+        ],
+        "agent",
+    );
+    assert_eq!(
+        from_and_session(&laptop, &id),
+        ("ws".into(), "agent-s".into())
+    );
+
+    // An IDE terminal opened from Claude Code: CLAUDECODE and a TTY, no
+    // CLAUDE_CODE_CHILD_SESSION. That is the human typing.
+    let id = post(
+        &[("CLAUDECODE", "1"), ("CLAUDE_CODE_SESSION_ID", "agent-s")],
+        "ide",
+    );
+    assert_eq!(
+        from_and_session(&laptop, &id),
+        (HUMAN.into(), String::new())
+    );
+    let (code, out) = on_tty(&plain, &[("CLAUDECODE", "1")], &format!("human close {id}")).unwrap();
+    assert_eq!(code, 0, "{out}");
+
+    // CLAUDECODE without a TTY (and without CLAUDE_CODE_CHILD_SESSION): an agent.
+    let id = ws.post("laptop", "agent without tty", &[]);
+    assert_eq!(
+        from_and_session(&laptop, &id),
+        ("ws".into(), "ws-session".into())
+    );
+
+    // A plain script: no Claude Code variables, no TTY: the machine.
+    let id = plain.post("laptop", "script", &[]);
+    assert_eq!(from_and_session(&laptop, &id), ("ws".into(), String::new()));
+    plain.run(&["human", "close", &id]).code(10);
+}
+
 #[test]
 fn the_human_at_a_terminal_closes_and_hands_over() {
     if std::process::Command::new("script")
@@ -828,4 +921,151 @@ fn records_that_break_a_rule_are_ignored_by_every_machine() {
     assert_eq!(rows(&r.stdout)[0][5], "open");
     // The addressee can still close it.
     laptop.run(&["close", &id]).ok();
+}
+
+/// A fake `ssh` for `GIT_SSH_COMMAND`: runs the git command it is given
+/// locally (so `ssh://host/<abs path>` reaches a local bare repo), but
+/// while `<dir>/refuse-push` exists it refuses `git-receive-pack` with
+/// GitHub's wording for a key without write access.
+fn fake_ssh(dir: &std::path::Path) -> (String, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let script = dir.join("fake-ssh");
+    let refuse = dir.join("refuse-push");
+    std::fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+case "$1" in -G) exit 0;; esac
+for a; do last="$a"; done
+case "$last" in
+  git-receive-pack*)
+    if [ -e '{refuse}' ]; then
+      echo 'ERROR: Permission to me/board.git denied to deploy-bot.' >&2
+      exit 1
+    fi;;
+esac
+exec sh -c "$last"
+"#,
+            refuse = refuse.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (script.to_str().unwrap().to_owned(), refuse)
+}
+
+#[test]
+fn a_push_refused_for_permissions_is_auth_and_the_queue_is_delivered_by_inbox() {
+    let (net, _ws, laptop) = pair();
+    let for_ws = laptop.post("ws", "for ws", &[]);
+    let tools = tempfile::TempDir::new().unwrap();
+    let (ssh, refuse) = fake_ssh(tools.path());
+    let url = format!("ssh://git@github.invalid{}", net.bare.display());
+    // ws reaches the board over (fake) SSH.
+    let mut ws = net.machine("ws", TWO);
+    ws.write_config(&url, TWO);
+    ws.env.push(("GIT_SSH_COMMAND".into(), ssh));
+    ws.run(&["inbox"]).ok();
+    let before = net.history().len();
+
+    std::fs::write(&refuse, "").unwrap();
+    // A plain post: exit 31 (auth, not offline), and it says it is queued.
+    let err = ws
+        .run(&["post", "--to", "laptop", "-m", "x", "while refused"])
+        .code(31);
+    assert!(err.contains("Permission to"), "{err}");
+    assert!(err.contains("queued locally"), "{err}");
+    assert!(!err.contains("offline"), "{err}");
+    assert_eq!(net.history().len(), before);
+    // A rule-bearing record: exit 31, nothing committed.
+    let err = ws.run(&["take", &for_ws]).code(31);
+    assert!(err.contains("nothing was committed"), "{err}");
+
+    // While queued, inbox and tasks warn on stderr, and still work.
+    let r = ws.run(&["inbox"]);
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(r.stderr.contains("queued locally"), "{r:?}");
+    assert!(r.stdout.contains(&for_ws), "{r:?}");
+    let r = ws.run(&["tasks"]);
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(r.stderr.contains("queued locally"), "{r:?}");
+
+    // doctor tries too, and reports what stays queued.
+    let v = ws.run(&["--format", "json", "doctor"]).json();
+    let queue = v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["check"] == "board-queue")
+        .unwrap()
+        .clone();
+    assert_eq!(queue["status"], "fail", "{queue}");
+    assert!(
+        queue["detail"].as_str().unwrap().contains("queued locally"),
+        "{queue}"
+    );
+
+    // Access fixed: the next inbox delivers the queued post, then is quiet.
+    std::fs::remove_file(&refuse).unwrap();
+    let r = ws.run(&["inbox"]);
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(!r.stderr.contains("queued"), "{r:?}");
+    assert_eq!(net.history().len(), before + 1);
+    assert_eq!(laptop.inbox_ids(false).len(), 1);
+    let r = ws.run(&["inbox"]);
+    assert_eq!(r.stderr, "", "{r:?}");
+    assert_eq!(net.history().len(), before + 1);
+}
+
+#[test]
+fn a_push_whose_result_is_unclear_is_checked_before_reporting() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let (net, mut ws, laptop) = pair();
+    ws.run(&["inbox"]).ok();
+    let before = net.history().len();
+    // The remote takes the commit, then holds the connection open past
+    // baton's git timeout: the push times out although it landed.
+    let hook = net.bare.join("hooks/post-receive");
+    std::fs::write(&hook, "#!/bin/sh\nsleep 4\n").unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    ws.env.push(("BATON_GIT_TIMEOUT_SECS".into(), "1".into()));
+    let r = ws.run(&["post", "--to", "laptop", "-m", "x", "slow remote"]);
+    assert_eq!(r.code, 0, "{r:?}");
+    let id = r.stdout.trim().to_owned();
+    assert!(!r.stderr.contains("queued"), "{r:?}");
+    assert_eq!(net.history().len(), before + 1);
+    std::fs::remove_file(&hook).unwrap();
+    assert_eq!(laptop.inbox_ids(false), vec![id]);
+    // Nothing is left queued to push twice.
+    ws.env.clear();
+    ws.post("laptop", "next", &[]);
+    assert_eq!(net.history().len(), before + 2);
+}
+
+#[test]
+fn a_message_to_any_taken_by_the_human_is_the_humans() {
+    if std::process::Command::new("script")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipped: no `script` to provide a TTY");
+        return;
+    }
+    let (_net, ws, laptop) = pair();
+    let id = laptop.post("any", "anyone", &[]);
+    let mut human = ws.clone();
+    human.agent = false;
+    let (code, out) = on_tty(&human, &[], &format!("take {id}")).unwrap();
+    assert_eq!(code, 0, "{out}");
+    // Claimed by the human: an agent cannot change it, nor claim it.
+    let err = ws.run(&["close", &id]).code(10);
+    assert!(err.contains("rule claim"), "{err}");
+    ws.run(&["take", &id]).code(10);
+    let v = ws.run(&["--format", "json", "show", &id]).json();
+    assert_eq!(v["items"][0]["addressee"], HUMAN);
+    // The human releases it; then an agent may claim it.
+    let (code, out) = on_tty(&human, &[], &format!("release {id}")).unwrap();
+    assert_eq!(code, 0, "{out}");
+    ws.run(&["take", &id]).ok();
 }

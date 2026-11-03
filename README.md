@@ -4,7 +4,7 @@ Coordinate AI coding agents that run on more than one machine, through git.
 
 You run Claude Code on a workstation and on a laptop. Each machine does what it is good at: one builds and deploys, the other runs tools only it has. To finish a task together, the agents need to hand work to each other: "you take the iOS part of this branch", "tests pass, it's yours", "I'm waiting on you". `baton` is that handoff.
 
-**Status: early.** The design is done and tested in experiments; the implementation is starting. Nothing here works yet.
+**Status: v1, under trial.** The commands below work and are tested end to end against real git; the design is in [docs/design.md](docs/design.md). Expect changes while it is tried on real work.
 
 ## How it works
 
@@ -15,7 +15,7 @@ You run Claude Code on a workstation and on a laptop. Each machine does what it 
 - **Untrusted by default.** A message is another agent's note. `baton` shows bodies inside a marked fence, keeps them out of hook output, scans posts for secrets, and never treats a message as your approval.
 - **Optional notes sync.** For a notes vault (e.g. Obsidian) kept in git and shared by the same machines, `baton sync` commits only the paths an agent changed. It rebases out of sight, so your notes never see conflict markers, and it never overwrites uncommitted work.
 
-## Planned commands
+## Commands
 
 ```
 baton inbox                         # what needs me (ids and metadata only)

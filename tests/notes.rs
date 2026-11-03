@@ -433,11 +433,11 @@ fn all_is_refused_for_agents() {
     let ws = w.machine("ws", false);
     ws.write("a.md", "a\n");
     let out = ws.agent(&["sync", "--all"]);
-    assert_eq!(code(&out), 1);
+    assert_eq!(code(&out), 10);
     assert!(stderr(&out).contains("--paths"), "{}", stderr(&out));
     assert!(ws.status().contains(&"?? a.md".to_owned()));
     let out = ws.agent(&["sweep"]);
-    assert_eq!(code(&out), 1);
+    assert_eq!(code(&out), 10);
 
     // The human (or a script) may.
     ws.write("b.md", "b\n");
@@ -537,9 +537,12 @@ fn sweep_commits_after_idle_and_leaves_out_failing_files() {
     assert_eq!(stdout(&out), "");
     assert_eq!(ws.status().len(), 2);
 
+    // The failing file is left out and reported on stderr; the timer's
+    // run still succeeds (exit 0), or it would fail every minute.
     let out = ws.baton_env(&["sweep"], &[("BATON_SWEEP_IDLE_SECS", "0")]);
-    assert_eq!(code(&out), 22, "{}", stderr(&out));
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
     assert!(stderr(&out).contains("bad.md"), "{}", stderr(&out));
+    assert!(stderr(&out).contains("check failed"), "{}", stderr(&out));
     let text = stdout(&out);
     assert!(text.contains("left-out\t\tbad.md"), "{text}");
     assert!(

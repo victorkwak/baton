@@ -140,6 +140,7 @@ impl Machine {
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env_remove("CLAUDECODE")
+            .env_remove("CLAUDE_CODE_CHILD_SESSION")
             .env_remove("CLAUDE_CODE_SESSION_ID")
             .env_remove("BATON_FAULT")
             .env_remove("BATON_SWEEP_IDLE_SECS")
