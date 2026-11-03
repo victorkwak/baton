@@ -52,16 +52,44 @@ impl Output {
     }
 }
 
-/// The `GIT_SSH_COMMAND` every call uses.
+/// Longest directory for the control socket: `<dir>/bcm-` plus 40 hex
+/// characters (`%C`) must stay under the ~104-byte Unix socket limit.
+const MAX_CONTROL_DIR: usize = 56;
+
+/// The `GIT_SSH_COMMAND` every call uses. Connection reuse only with a
+/// private directory: with `ControlMaster=auto`, ssh uses any socket already
+/// at the path, so a directory another user can write to (like `/tmp`)
+/// would let them sit in the middle of the connection.
 pub fn ssh_command() -> String {
-    let dir = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .filter(|p| p.is_dir())
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    format!(
-        "ssh -o BatchMode=yes -o ConnectTimeout=10 -o ControlMaster=auto -o ControlPersist=60 -o ControlPath={}/bcm-%C",
-        dir.display()
-    )
+    const BASE: &str = "ssh -o BatchMode=yes -o ConnectTimeout=10";
+    match control_dir() {
+        Some(dir) => format!(
+            "{BASE} -o ControlMaster=auto -o ControlPersist=60 -o 'ControlPath={}/bcm-%C'",
+            dir.display()
+        ),
+        None => format!("{BASE} -o ControlMaster=no"),
+    }
+}
+
+/// `$XDG_RUNTIME_DIR`, else `~/.ssh`: the first that is private (owned by
+/// the user who owns `$HOME`, no group or other permissions), short enough,
+/// and safe to quote.
+fn control_dir() -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt as _;
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let owner = std::fs::metadata(&home).ok()?.uid();
+    let candidates = [
+        std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
+        Some(home.join(".ssh")),
+    ];
+    candidates.into_iter().flatten().find(|dir| {
+        let text = dir.to_string_lossy();
+        std::fs::symlink_metadata(dir)
+            .is_ok_and(|m| m.is_dir() && m.uid() == owner && m.mode() & 0o077 == 0)
+            && dir.is_absolute()
+            && text.len() <= MAX_CONTROL_DIR
+            && !text.contains(['\'', '"', ' ', '\\', '%'])
+    })
 }
 
 impl Git {
@@ -257,10 +285,20 @@ mod tests {
     }
 
     #[test]
-    fn control_path_is_short() {
+    fn control_path_is_short_and_private_or_off() {
         let cmd = ssh_command();
-        let path = cmd.rsplit("ControlPath=").next().unwrap();
-        // %C expands to 40 hex characters; the socket limit is about 104-108 bytes.
-        assert!(path.len() - 2 + 40 < 100, "{path}");
+        assert!(cmd.contains("BatchMode=yes"), "{cmd}");
+        match cmd.split("ControlPath=").nth(1) {
+            Some(rest) => {
+                let path = rest.trim_end_matches('\'');
+                // %C expands to 40 hex characters; the socket limit is about 104 bytes.
+                assert!(path.len() - 2 + 40 < 104, "{path}");
+                assert!(!path.starts_with("/tmp"), "{path}");
+                let dir = std::path::Path::new(path).parent().unwrap();
+                use std::os::unix::fs::MetadataExt as _;
+                assert_eq!(std::fs::metadata(dir).unwrap().mode() & 0o077, 0, "{path}");
+            }
+            None => assert!(cmd.contains("ControlMaster=no"), "{cmd}"),
+        }
     }
 }
