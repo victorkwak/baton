@@ -480,8 +480,21 @@ fn guard_with(
     cwd: &Path,
     path_first: Option<&Path>,
 ) -> Option<(String, String)> {
+    guard_env(m, tool, input, cwd, path_first, &[])
+}
+
+/// `guard_with`, with extra environment variables for the hook process.
+fn guard_env(
+    m: &Machine,
+    tool: &str,
+    input: Value,
+    cwd: &Path,
+    path_first: Option<&Path>,
+    env: &[(&str, &str)],
+) -> Option<(String, String)> {
     let mut cmd = hook_cmd(m, &["hook", "guard"], None, Some("s"));
-    cmd.env("PATH", test_path(path_first));
+    cmd.env("PATH", test_path(path_first)).env_remove("CDPATH");
+    cmd.envs(env.iter().copied());
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -989,6 +1002,17 @@ fn guard_never_silently_allows_known_bypass_shapes() {
         "cd {TP}/* && git commit",
         "cd - && git commit",
         "cd ~nobody && git commit",
+        // paths inside quoted strings, expansions, CDPATH (review 2, findings 1-3)
+        "bash -c \"cd {TP} && cd {TB} && git commit\"",
+        "cd {TP} && sh -c 'git -C ./{TB}/sub commit'",
+        "cd {TP} && python3 -c \"import os; os.chdir('{TB}'); os.system('git commit')\"",
+        "cd {TP} && git -C {TB}/$SUB commit",
+        "cd {TP} && git -C \"{TB}\"/`echo sub` commit",
+        "git -C $D/{TB} commit",
+        "git -C ${D}/{TB} commit",
+        "git -C `pwd`/{TB} commit",
+        "export CDPATH={TP}; cd {TB} && git commit",
+        "CDPATH={TP} cd {TB}; git add .",
         // option checks after `--` and after value-taking options (finding 3)
         "git -C {T} log -- --output=/tmp/x",
         "git -C {T} log -n --output=/tmp/x",
@@ -1050,9 +1074,24 @@ fn guard_never_silently_allows_known_bypass_shapes() {
         format!("cd $D && ls {bb}"),
         format!("cd {bp}/nope && rm -rf {bb}"),
         format!("cd {bp} && cd {bb}/.. && cd {bb} && ls"),
+        format!("bash -c \"cd {bp} && cd {bb} && ls\""),
+        format!("cd {bp} && python3 -c \"import shutil; shutil.rmtree('{bb}')\""),
+        format!("cd {bp} && cat {bb}/$F"),
+        format!("ls $D/{bb}"),
+        format!("ls ${{D}}/{bb}/messages"),
+        format!("ls `pwd`/{bb}"),
+        format!("export CDPATH={bp}; cd {bb} && ls"),
     ] {
         asks_or_denies(ws, &cmd, &s.repo);
     }
+    // CDPATH in the hook's environment: a bare relative cd is unresolved.
+    let np = s.notes.parent().unwrap().to_str().unwrap().to_owned();
+    let env = [("CDPATH", np.as_str())];
+    let run = |cmd: &str| guard_env(ws, "Bash", json!({"command": cmd}), &s.repo, None, &env);
+    assert_eq!(decision(&run("cd notes && git commit -m x")), Some("ask"));
+    assert_eq!(decision(&run("cd notes; ls")), Some("ask"));
+    assert_eq!(run("cd ./via-link && cargo test"), None);
+    assert_eq!(run("cd src && cargo test"), None);
     // Only the real baton is exempt in the board clone.
     for cmd in [
         format!("PATH=/tmp/x baton {b}"),

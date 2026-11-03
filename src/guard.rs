@@ -182,28 +182,54 @@ fn bash(t: &str, ctx: &Ctx, d: &mut Decision) {
     if words.as_deref().is_some_and(|w| real_baton(w, &ctx.cwd)) {
         return;
     }
-    let loose = loose_words(t);
-    let (dirs, unresolved) = work_dirs(&loose, &ctx.cwd);
     let toks = tokens(t);
     let has = |w: &str| toks.iter().any(|t| t == w);
     let git = has("git");
+    let loose = loose_words(t);
+    // `CDPATH` (set here or in the environment) can send a relative `cd`
+    // anywhere.
+    let cdpath = has("cdpath") || std::env::var_os("CDPATH").is_some_and(|v| !v.is_empty());
+    // The raw text split on quotes and operators too: a quoted string
+    // (`bash -c "cd x && …"`, `python -c "…"`) can hold paths and `cd`s.
+    let raw = raw_words(t);
+    let (mut dirs, mut unresolved) = work_dirs(&loose, &ctx.cwd, cdpath);
+    let (more, raw_unresolved) = work_dirs(&raw, &ctx.cwd, cdpath);
+    unresolved |= raw_unresolved;
+    for d in more {
+        if !dirs.contains(&d) {
+            dirs.push(d);
+        }
+    }
+    let mut cands: Vec<&str> = loose
+        .iter()
+        .chain(&raw)
+        .flatten()
+        .map(String::as_str)
+        .collect();
+    cands.sort_unstable();
+    cands.dedup();
+    let roots: Vec<&Path> = [ctx.board.as_deref(), ctx.notes.as_deref()]
+        .into_iter()
+        .flatten()
+        .collect();
+    // A word with an expansion that may name a baton repo is unresolved.
+    unresolved |= cands.iter().any(|w| {
+        w.contains(['$', '`'])
+            && !w.starts_with("$HOME/")
+            && !w.starts_with("${HOME}/")
+            && (w.contains('/') || roots.iter().any(|r| could_name(w, r)))
+    });
     // Does the command run in, or name, something inside `root`?
     let hits = |root: &Path| {
         dirs.iter().any(|d| inside(d, root))
             || names(t, root)
-            || loose
+            || cands
                 .iter()
-                .flatten()
                 .any(|w| dirs.iter().any(|d| word_under(d, w, root)))
     };
-    let roots = [ctx.board.as_deref(), ctx.notes.as_deref()];
     if unresolved
-        && roots.iter().flatten().next().is_some()
-        && (git
-            || roots
-                .iter()
-                .flatten()
-                .any(|r| loose.iter().flatten().any(|w| could_name(w, r))))
+        && !roots.is_empty()
+        && (git || roots.iter().any(|r| cands.iter().any(|w| could_name(w, r))))
     {
         d.ask("a directory change baton cannot resolve, near git or a baton repo");
     }
@@ -595,13 +621,37 @@ fn loose_words(t: &str) -> Vec<Option<String>> {
     out
 }
 
+/// The raw text split on whitespace, quotes, backticks, `=`, `:`, `<`,
+/// `>`; `None` at `; & | ( )` and newlines. Nothing is unquoted.
+fn raw_words(t: &str) -> Vec<Option<String>> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for c in t.chars() {
+        let sep = matches!(c, ';' | '&' | '|' | '(' | ')' | '\n');
+        if sep || c.is_whitespace() || "'\"`=:<>".contains(c) {
+            if !cur.is_empty() {
+                out.push(Some(std::mem::take(&mut cur)));
+            }
+            if sep {
+                out.push(None);
+            }
+        } else {
+            cur.push(c);
+        }
+    }
+    if !cur.is_empty() {
+        out.push(Some(cur));
+    }
+    out
+}
+
 const MAX_DIRS: usize = 64;
 
 /// Every directory a part of the command may run in: the cwd, then each
 /// target of `cd`/`pushd` and of `-C` (`git -C`, `env -C`) resolved against
 /// every directory found so far (so both cumulatively and on its own),
 /// physically and logically. `true` when a target cannot be resolved.
-fn work_dirs(words: &[Option<String>], cwd: &Path) -> (Vec<PathBuf>, bool) {
+fn work_dirs(words: &[Option<String>], cwd: &Path, cdpath: bool) -> (Vec<PathBuf>, bool) {
     let mut dirs = vec![physical(cwd)];
     let mut unresolved = false;
     for (i, w) in words.iter().enumerate() {
@@ -634,7 +684,17 @@ fn work_dirs(words: &[Option<String>], cwd: &Path) -> (Vec<PathBuf>, bool) {
         let is_cd = w.as_deref() != Some("-C");
         let target = expand_home(&target);
         let text = target.to_string_lossy();
-        if text == "-" || text.starts_with('~') || text.contains(['$', '`', '*', '?', '[', '{']) {
+        let via_cdpath = is_cd
+            && cdpath
+            && !target.is_absolute()
+            && !matches!(text.as_ref(), "." | "..")
+            && !text.starts_with("./")
+            && !text.starts_with("../");
+        if via_cdpath
+            || text == "-"
+            || text.starts_with('~')
+            || text.contains(['$', '`', '*', '?', '[', '{'])
+        {
             unresolved = true;
             continue;
         }
@@ -666,10 +726,14 @@ fn word_under(dir: &Path, w: &str, root: &Path) -> bool {
     std::iter::once(w)
         .chain(tail)
         .flat_map(|x| std::iter::once(x).chain(x.split(':')))
-        .filter(|x| {
-            !x.is_empty()
-                && (!x.contains(['$', '`']) || x.starts_with("$HOME/") || x.starts_with("${HOME}/"))
+        .map(|x| {
+            // An expansion: only its literal prefix is known.
+            if x.starts_with("$HOME/") || x.starts_with("${HOME}/") {
+                return x;
+            }
+            x.find(['$', '`']).map_or(x, |i| &x[..i])
         })
+        .filter(|x| !x.is_empty())
         .any(|x| {
             let x = expand_home(x);
             let s = x.to_string_lossy();
@@ -684,12 +748,30 @@ fn word_under(dir: &Path, w: &str, root: &Path) -> bool {
 
 /// Could word `w` name `root` once some unknown directory is prepended
 /// (the last components of `root`, such as `board` or `baton/board`)?
+/// With an expansion (`$D/board`, `` `pwd`/board ``), the literal part
+/// after it is checked; any leading part of the word counts.
 fn could_name(w: &str, root: &Path) -> bool {
-    let w = w.trim_end_matches('/');
-    !w.is_empty()
-        && !matches!(w, "." | "..")
-        && !w.contains('$')
-        && (root.ends_with(w) || physical(root).ends_with(w))
+    let w = match w.rfind(['$', '`']) {
+        Some(i) => match w[i + 1..].split_once('/') {
+            Some((_, rest)) => rest,
+            None => return false,
+        },
+        None => w,
+    };
+    // Any leading part (`board`, `board/messages`) may end the root path.
+    let real = physical(root);
+    let mut part = PathBuf::new();
+    for c in Path::new(w).components() {
+        let Component::Normal(n) = c else {
+            part.clear();
+            continue;
+        };
+        part.push(n);
+        if root.ends_with(&part) || real.ends_with(&part) {
+            return true;
+        }
+    }
+    false
 }
 
 fn expand_home(w: &str) -> PathBuf {
