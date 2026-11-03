@@ -18,6 +18,7 @@ pub mod store;
 pub mod notes;
 
 // Claude Code integration (plan: agent C).
+pub mod guard;
 pub mod hooks;
 
 /// Shared state for one command run.

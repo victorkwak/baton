@@ -181,8 +181,16 @@ Nothing picks up board messages by itself. A new session knows nothing about the
 | Hook | Command | Effect |
 |---|---|---|
 | `Stop` | `baton hook wait` with `"asyncRewake": true, "timeout": 3600` | The waiter (below). |
-| `PreToolUse` on `Bash` | `baton hook guard` | In the notes repo: only read-only git (`status`, `log`, `diff`, `show`, `rev-parse`, `ls-files`, `blame`, `grep`); other git → deny "use baton sync". In the board clone: deny all git. Elsewhere: allow `git push` of a feature branch; ask for `main`/`master`, `--force*`, `--delete`/`:ref`, tags, `--mirror`, or a branch another machine owns. |
-| `PreToolUse` on `Write\|Edit\|MultiEdit\|NotebookEdit` | `baton hook guard` | Deny writes under the board clone. |
+| `PreToolUse` on `Bash` | `baton hook guard` | The guard (below). |
+| `PreToolUse` on `Write\|Edit\|MultiEdit\|NotebookEdit` | `baton hook guard` | Deny when the path (symlinks resolved, also for a file not yet written) is in the board clone. |
+
+**The guard (`hook guard`)** is a backstop, not a boundary (D6). It never allows: it denies board writes and notes writes, asks when unsure, and says nothing for simple safe cases, which leaves the call to Claude Code's normal permissions. It does not parse shell. A command is **simple** when it is one command with no unquoted `;` `&` `|` `<` `>` `$` backtick `(` `)` `*` `?` `[` `]` `{` `}`, newline or leading `#`, no backslash outside single quotes, no `$`, backtick or backslash inside double quotes, and no `VAR=` prefix. Only a simple command passes silently. "Names a repo" means its path appears in the text (raw, physical, `~/`, `$HOME/`), or a path-like word resolves (symlinks too) inside it.
+
+1. **Board clone:** deny when the cwd is inside it or the text names it, unless the command is one simple invocation of this `baton` binary (by name through `PATH`, or by a path that resolves to it).
+2. **Notes repo:** when the text has the word `git` anywhere (also inside strings: this catches `python -c`, `perl -e`, `ssh host git …`, `su -c`) and the cwd is inside the notes repo or the text names it: a simple `git [--no-pager] [-C <notes>] <sub> …` with `sub` in `status`, `log`, `diff`, `show`, `rev-parse`, `ls-files`, `blame`, `grep` and only known-safe options (exact names; an abbreviation asks) is silent; another simple git subcommand is denied ("use `baton sync`"); anything else asks.
+3. **Push:** when the text has the word `push`, or `gh`/`glab` with `merge` or `refs`, or `send-pack`: a simple `git push [-u] <remote> <refspec>…` (or a plain `git push [remote]` with `push.default` `simple`, `current` or `upstream` and no `remote.*.push`) whose destination branches are not `main`/`master`, not tags or other refs, not deleted, not forced, and not owned by another machine (latest handover in the local board clone, no fetch) is silent; `-n`/`--dry-run` is silent; a simple non-pushing git command (`commit -m "push …"`, `stash push`) is silent; anything else asks.
+
+Words that only name git through a runtime value (`eval "$X"`, `bash -s < script`, `$CMD`) are not seen; Claude Code's permissions still apply to them. The `Bash` hook has no `if` filter (such as `Bash(*git*)`): rule 1 needs every command.
 
 **The waiter (`hook wait`):**
 - It reads stdin JSON (`session_id`, `cwd`) and takes a per-session lock; if another waiter for the session holds it, it exits 0.
