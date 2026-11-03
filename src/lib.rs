@@ -17,6 +17,9 @@ pub mod store;
 // Notes sync (plan: agent B).
 pub mod notes;
 
+// Claude Code integration (plan: agent C).
+pub mod hooks;
+
 /// Shared state for one command run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Format {
