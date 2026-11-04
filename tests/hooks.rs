@@ -849,6 +849,8 @@ fn guard_pushes() {
         "git push -n origin main",
         "git commit -m 'push the fix'",
         "git stash push -m wip",
+        "python3 - <<'EOF'\nprint('push the fix')\nEOF",
+        "cd /tmp && python3 -I - <<'PY'\ns = '/// Retries the push.'\nPY",
         "cargo test 2>&1 | tail",
         "echo hello > notes.txt",
     ] {
@@ -888,6 +890,10 @@ fn guard_pushes() {
         "git config alias.pf 'push --force'",
         "git send-pack origin refs/heads/main",
         "make push",
+        "python3 - <<'EOF'\nimport subprocess; subprocess.run(['git', 'push'])\nEOF",
+        "sh <<'EOF'\n./scripts/push.sh\nEOF",
+        "cat > x <<'EOF'\nhi\nEOF\nmake push",
+        "python3 - <<EOF\nprint('push')\nEOF",
         "gh pr merge 1 --squash",
         "glab mr merge 1",
     ] {

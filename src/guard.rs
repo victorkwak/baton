@@ -265,7 +265,19 @@ fn bash(t: &str, ctx: &Ctx, d: &mut Decision) {
     {
         notes_case(words.as_deref(), notes, ctx, d);
     }
-    if has("push")
+    // `push` only in the body of a quoted here-document (source text an
+    // edit script writes) is data, unless git or a shell reads it.
+    let shell = ["sh", "bash", "zsh", "dash", "ksh", "source"]
+        .iter()
+        .any(|s| has(s));
+    let push_word = if git || reeval || shell {
+        has("push")
+    } else {
+        tokens(&without_literal_heredocs(t))
+            .iter()
+            .any(|w| w == "push")
+    };
+    if push_word
         || ((has("gh") || has("glab")) && (has("merge") || has("refs")))
         || t.contains("send-pack")
     {
@@ -901,6 +913,31 @@ fn heredoc_group_len(s: &str) -> Option<usize> {
         }
     }
     None
+}
+
+/// `t` without the bodies of here-documents whose delimiter is quoted
+/// (`<<'X'`, `<<"X"`): no expansion happens in them. An unterminated body
+/// runs to the end.
+fn without_literal_heredocs(t: &str) -> String {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| regex::Regex::new(r#"<<-?\s*(?:'(\w+)'|"(\w+)")"#).unwrap());
+    let mut out = String::new();
+    let mut delims: Vec<String> = Vec::new();
+    for line in t.split_inclusive('\n') {
+        if let Some(d) = delims.first() {
+            if line.trim_start_matches('\t').trim_end_matches('\n') == d {
+                delims.remove(0);
+            }
+            continue;
+        }
+        out.push_str(line);
+        for caps in re.captures_iter(line) {
+            if let Some(d) = caps.get(1).or_else(|| caps.get(2)) {
+                delims.push(d.as_str().to_owned());
+            }
+        }
+    }
+    out
 }
 
 /// Is `group` exactly `$(cat <<'X'` … `X` `)` (a literal text)?
