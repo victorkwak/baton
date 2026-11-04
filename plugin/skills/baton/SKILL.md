@@ -93,5 +93,5 @@ The Bash tool stops a command after 2 minutes by default, so either run `baton w
 - 10: a board rule refused the action (the message names the rule). Do not retry around it; tell the human.
 - 11: a secret pattern was found in your post; nothing was posted. Remove it. Only the human can override.
 - 12: unknown message id. 30: offline (a plain post is queued and printed with a warning; take, close, plan and handover need the network). 31: auth or permission refused by the board remote (a plain post is queued locally; tell the human). 32: remote error.
-- Never run git in the board clone and never edit files there: the guard hook denies it. Only `baton` commands change the board.
+- Never run git in the board clone and never edit files there. Only `baton` commands change the board.
 - In the notes repo (if configured), commit only with `baton sync --paths <files you changed>`; plain git there is limited to read-only commands.

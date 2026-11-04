@@ -79,8 +79,12 @@ fn exe() -> Result<PathBuf> {
 }
 
 /// The settings to merge into `~/.claude/settings.json`.
-pub fn claude_settings(exe: &Path) -> Value {
+/// Agents change the board only through `baton`: file edits in the board
+/// clone are denied.
+pub fn claude_settings(exe: &Path, board: &Path) -> Value {
     let bin = sh_quote(&exe.to_string_lossy());
+    let board = board.to_string_lossy();
+    let board = board.trim_start_matches('/');
     json!({
         "hooks": {
             "Stop": [{
@@ -90,17 +94,7 @@ pub fn claude_settings(exe: &Path) -> Value {
                     "asyncRewake": true,
                     "timeout": 3600
                 }]
-            }],
-            "PreToolUse": [
-                {
-                    "matcher": "Bash",
-                    "hooks": [{ "type": "command", "command": format!("{bin} hook guard") }]
-                },
-                {
-                    "matcher": "Write|Edit|MultiEdit|NotebookEdit",
-                    "hooks": [{ "type": "command", "command": format!("{bin} hook guard") }]
-                }
-            ]
+            }]
         },
         "permissions": {
             "allow": [
@@ -113,7 +107,8 @@ pub fn claude_settings(exe: &Path) -> Value {
                 "Bash(baton take:*)",
                 "Bash(baton close:*)",
                 "Bash(baton release:*)"
-            ]
+            ],
+            "deny": [format!("Edit(//{board}/**)")]
         }
     })
 }
@@ -249,7 +244,8 @@ pub fn init(args: InitArgs) -> Result<()> {
     out!();
     out!(
         "{}",
-        serde_json::to_string_pretty(&claude_settings(&exe)).map_err(anyhow::Error::from)?
+        serde_json::to_string_pretty(&claude_settings(&exe, store.path()))
+            .map_err(anyhow::Error::from)?
     );
     out!();
     out!("2. Install the /baton skill (the plugin in baton's repo, `plugin/`):");
@@ -451,45 +447,12 @@ fn check_hooks(r: &mut Report) {
         }
     }
     let pre = hook_entries(&settings, "PreToolUse");
-    let guard = |tool: &str| {
-        pre.iter().find(|(m, h)| {
-            is_baton(h, "hook guard") && m.split('|').any(|x| x.trim() == tool || x.trim() == "*")
-        })
-    };
-    for (name, tools) in [
-        ("hook-guard-bash", &["Bash"][..]),
-        (
-            "hook-guard-edit",
-            &["Write", "Edit", "MultiEdit", "NotebookEdit"][..],
-        ),
-    ] {
-        let missing: Vec<&str> = tools
-            .iter()
-            .copied()
-            .filter(|t| guard(t).is_none())
-            .collect();
-        let broken = tools
-            .iter()
-            .filter_map(|t| guard(t))
-            .find_map(|(_, h)| missing_program(h));
-        if let Some(p) = broken {
-            r.add(Status::Fail, name, format!("{p} does not exist"));
-        } else if missing.is_empty() {
-            r.add(
-                Status::Ok,
-                name,
-                format!("PreToolUse guard on {}", tools.join("|")),
-            );
-        } else {
-            r.add(
-                Status::Warn,
-                name,
-                format!(
-                    "no PreToolUse `baton hook guard` for {}",
-                    missing.join(", ")
-                ),
-            );
-        }
+    if pre.iter().any(|(_, h)| is_baton(h, "hook guard")) {
+        r.add(
+            Status::Warn,
+            "hook-guard",
+            "the PreToolUse `baton hook guard` hook is obsolete (a no-op); remove it",
+        );
     }
 }
 

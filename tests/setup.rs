@@ -70,14 +70,11 @@ fn init_writes_config_clones_and_prints_settings() {
     assert_eq!(stop["asyncRewake"], true);
     assert_eq!(stop["timeout"], 3600);
     assert!(stop["command"].as_str().unwrap().ends_with(" hook wait"));
-    let pre = s["hooks"]["PreToolUse"].as_array().unwrap();
-    assert_eq!(pre[0]["matcher"], "Bash");
-    assert_eq!(pre[1]["matcher"], "Write|Edit|MultiEdit|NotebookEdit");
+    assert!(s["hooks"].get("PreToolUse").is_none(), "{s}");
+    let deny = s["permissions"]["deny"][0].as_str().unwrap();
     assert!(
-        pre[1]["hooks"][0]["command"]
-            .as_str()
-            .unwrap()
-            .ends_with(" hook guard")
+        deny.starts_with("Edit(//") && deny.ends_with("/board/**)"),
+        "{deny}"
     );
     assert!(!out.contains("SessionStart"));
     // No notes repo: no sweeper.
@@ -291,10 +288,18 @@ fn doctor_reports_each_check() {
     )
     .unwrap();
     let rows = doctor_rows(&m.run(&["doctor"]).ok());
-    for check in ["hook-wait", "hook-guard-bash", "hook-guard-edit"] {
-        assert_eq!(status_of(&rows, check), "ok", "{check}: {rows:?}");
-    }
+    assert_eq!(status_of(&rows, "hook-wait"), "ok", "{rows:?}");
     assert!(rows.iter().all(|r| r.0 == "ok"), "{rows:?}");
+
+    // A leftover guard hook from before its removal warns.
+    let mut s = settings_block(&out);
+    s["hooks"]["PreToolUse"] = serde_json::json!([{
+        "matcher": "Bash",
+        "hooks": [{ "type": "command", "command": "baton hook guard" }]
+    }]);
+    std::fs::write(claude.join("settings.json"), s.to_string()).unwrap();
+    let rows = doctor_rows(&m.run(&["doctor"]).ok());
+    assert_eq!(status_of(&rows, "hook-guard"), "warn", "{rows:?}");
 
     // A Stop hook without asyncRewake fails; an interrupted sync warns.
     let mut s = settings_block(&out);

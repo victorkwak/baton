@@ -1,5 +1,5 @@
-//! Claude Code hooks: `hook wait` (Stop, asyncRewake) and the dispatch of
-//! `hook guard` (PreToolUse, in `guard.rs`). Owner: agent C (`docs/plan.md`). Behaviour:
+//! Claude Code hooks: `hook wait` (Stop, asyncRewake). Owner: agent C
+//! (`docs/plan.md`). Behaviour:
 //! `docs/design.md`, "Claude Code hooks". No SessionStart hook: work is
 //! picked up only with `/baton`.
 
@@ -25,14 +25,16 @@ use crate::store::Store;
 pub enum HookCommand {
     /// Stop (asyncRewake): wait for an actionable message; exit 2 to wake.
     Wait,
-    /// PreToolUse: guard git and file writes.
+    /// Removed (Claude Code permissions protect); a no-op kept so an old
+    /// `PreToolUse` hook does not fail every tool call.
+    #[command(hide = true)]
     Guard,
 }
 
 pub fn hook(cmd: HookCommand) -> Result<()> {
     match cmd {
         HookCommand::Wait => wait(),
-        HookCommand::Guard => crate::guard::run(),
+        HookCommand::Guard => Ok(()),
     }
 }
 

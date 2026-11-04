@@ -1,5 +1,5 @@
 //! Claude Code integration core: session keys and arming for the waiter.
-//! The guard is in `guard.rs`. Owner: agent C (`docs/plan.md`).
+//! Owner: agent C (`docs/plan.md`).
 //! Behaviour: `docs/design.md`, "Claude Code hooks".
 //!
 //! **Session keys.** The hook's stdin `session_id` changes when a Claude Code
