@@ -2,6 +2,12 @@
 
 All notable changes to `baton` (crate `baton-touch`). Versions follow [Semantic Versioning](https://semver.org/); before 1.0, a breaking change bumps the minor version.
 
+## [0.2.2] - 2026-11-03
+
+### Changed
+
+- Handoff timing: the `/baton` skill tells the lead to post a plan as soon as the follower's items are unblocked (the human's decisions and the contract between the two sides: API shape, data formats, names, the branch and commit to start from), then do its own part in parallel, and to put the handoff right after the step that settles the contract in its task list, not at the end. Later changes the follower relies on go out as a reply in the task. `docs/design.md` follows it. No code change.
+
 ## [0.2.1] - 2026-11-03
 
 ### Changed

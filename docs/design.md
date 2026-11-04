@@ -177,7 +177,7 @@ Data goes to stdout, diagnostics to stderr. With no TTY, nothing prompts. Every 
 
 Nothing picks up board messages by itself. A session knows nothing about the board until the human runs `/baton` in it, and no notification is sent. The human chooses the session:
 
-1. The lead machine's agent posts the plan or the handoff (`baton post --to laptop …`).
+1. The lead machine's agent posts the plan or the handoff (`baton post --to laptop …`). It posts as soon as the follower's items are unblocked (the human's decisions and the contract between the two sides are settled), then does its own part in parallel; it does not finish its own part first (Victor, 2026-11-03: a plan left to the end of the lead's task list made the other machine wait for the whole job).
 2. On the other machine, the human runs `/baton` in whichever Claude Code session they want to do the work. It can be an existing session or a new one.
 3. `/baton` is a Claude Code skill (in `plugin/`). It runs `baton on`, then `baton inbox`, shows what is waiting for this machine, and with the human's go-ahead runs `baton take <id>` and `baton show <id>`, then starts the work.
 4. `baton on` makes the session **listen** (Victor, 2026-11-03: "listen until off") until `/baton:off`. What wakes it depends on its lane (below). On a wake for new work the skill still asks the human before taking it.
