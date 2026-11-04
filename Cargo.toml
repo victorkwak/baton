@@ -1,6 +1,6 @@
 [package]
 name = "baton-touch"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.89"
 description = "Coordinate AI coding agents running on several machines through git: a shared append-only message board, lead/follower handoffs, and hooks that wake an idle agent only when a message needs it."

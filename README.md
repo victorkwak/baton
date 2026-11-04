@@ -4,7 +4,7 @@ Coordinate AI coding agents that run on more than one machine, through git.
 
 You run Claude Code on a workstation and on a laptop. Each machine does what it is good at: one builds and deploys, the other runs tools only it has. To finish a task together, the agents need to hand work to each other: "you take the iOS part of this branch", "tests pass, it's yours", "I'm waiting on you". `baton` is that handoff.
 
-**Status: v1, under trial.** The commands below work and are tested end to end against real git; the design is in [docs/design.md](docs/design.md). Expect changes while it is tried on real work.
+**Status: 0.2, under trial.** Changes per version: [CHANGELOG.md](CHANGELOG.md). The commands below work and are tested end to end against real git; the design is in [docs/design.md](docs/design.md). Expect changes while it is tried on real work.
 
 ## How it works
 
