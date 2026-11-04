@@ -58,6 +58,9 @@ static RE_AT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$").unwrap());
 static RE_TASK: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[a-z0-9][a-z0-9-]{0,47}$").unwrap());
+/// At most 24 characters: never mistaken for a 26-character message id.
+static RE_LANE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[a-z0-9][a-z0-9-]{0,23}$").unwrap());
 static RE_SESSION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$").unwrap());
 static RE_BRANCH: LazyLock<Regex> = LazyLock::new(|| {
@@ -125,6 +128,14 @@ pub fn check_task(task: &str) -> Result<()> {
         Ok(())
     } else {
         Err(bad("task", task, "[a-z0-9][a-z0-9-]{0,47}"))
+    }
+}
+
+pub fn check_lane(lane: &str) -> Result<()> {
+    if RE_LANE.is_match(lane) {
+        Ok(())
+    } else {
+        Err(bad("lane", lane, "[a-z0-9][a-z0-9-]{0,23}"))
     }
 }
 
@@ -277,6 +288,8 @@ pub struct Message {
     pub at: String,
     pub from: String,
     pub to: String,
+    /// The stream of work (`docs/design.md`, "Lanes"); empty for none.
+    pub lane: String,
     pub task: String,
     pub kind: MsgKind,
     pub reply_to: String,
@@ -298,6 +311,9 @@ impl Message {
         check_at(&self.at)?;
         check_name("from", &self.from)?;
         check_to(&self.to)?;
+        if !self.lane.is_empty() {
+            check_lane(&self.lane)?;
+        }
         if !self.task.is_empty() {
             check_task(&self.task)?;
         }
@@ -343,6 +359,10 @@ impl Message {
         kv("at", &self.at);
         kv("from", &self.from);
         kv("to", &self.to);
+        // Left out when empty, so records from before lanes stay canonical.
+        if !self.lane.is_empty() {
+            kv("lane", &self.lane);
+        }
         kv("task", &self.task);
         kv("kind", self.kind.as_str());
         kv("reply_to", &self.reply_to);
@@ -380,6 +400,13 @@ impl Message {
                 .ok_or_else(|| err("frontmatter line without `key: value`"))?;
             fields.push((k, v));
         }
+        // `lane` is the one optional key, right after `to`.
+        let lane = if fields.get(4).is_some_and(|(k, _)| *k == "lane") {
+            let (_, v) = fields.remove(4);
+            unscalar(v).ok_or_else(|| err("lane"))?
+        } else {
+            String::new()
+        };
         const KEYS: [&str; 10] = [
             "id", "at", "from", "to", "task", "kind", "reply_to", "related", "branch", "session",
         ];
@@ -403,6 +430,7 @@ impl Message {
             at: get(1)?,
             from: get(2)?,
             to: get(3)?,
+            lane,
             task: get(4)?,
             kind: MsgKind::parse(&get(5)?).ok_or_else(|| err("unknown kind"))?,
             reply_to: get(6)?,
@@ -615,6 +643,7 @@ mod tests {
             at: "2026-11-03T10:20:30Z".into(),
             from: "ws".into(),
             to: "laptop".into(),
+            lane: "ios".into(),
             task: "fix-login".into(),
             kind: MsgKind::Plan,
             reply_to: String::new(),
@@ -637,8 +666,11 @@ mod tests {
         let rec = Record::parse(&m.path(), &text).unwrap();
         assert_eq!(rec, Record::Message(m.clone()));
 
+        assert!(text.contains("\nto: laptop\nlane: ios\ntask: fix-login\n"));
+
         let mut plain = m.clone();
         plain.kind = MsgKind::Plain;
+        plain.lane.clear();
         plain.task.clear();
         plain.branch.clear();
         plain.related.clear();
@@ -646,7 +678,25 @@ mod tests {
         plain.body.clear();
         let text = plain.render();
         assert!(text.contains("kind: \"\"\n") && text.contains("related: []\n"));
+        // No lane: no `lane` line, as in records from before lanes.
+        assert!(!text.contains("lane"));
         assert_eq!(Message::parse(&text).unwrap(), plain);
+    }
+
+    #[test]
+    fn lane_is_optional_but_canonical() {
+        let text = msg().render();
+        // An empty lane is written by leaving the line out, never as "".
+        let t = text.replacen("lane: ios", "lane: \"\"", 1);
+        assert!(Message::parse(&t).is_err());
+        // Only right after `to`.
+        let t = text
+            .replacen("lane: ios\n", "", 1)
+            .replacen("session:", "lane: ios\nsession:", 1);
+        assert!(Message::parse(&t).is_err());
+        // Needless quotes.
+        let t = text.replacen("lane: ios", "lane: \"ios\"", 1);
+        assert!(Message::parse(&t).is_err());
     }
 
     #[test]
@@ -687,6 +737,10 @@ mod tests {
             Box::new(|m| m.from = "ws;rm".into()),
             Box::new(|m| m.to = "lap top".into()),
             Box::new(|m| m.to = "".into()),
+            Box::new(|m| m.lane = "iOS".into()),
+            Box::new(|m| m.lane = "-ios".into()),
+            Box::new(|m| m.lane = "a".repeat(25)),
+            Box::new(|m| m.lane = "a b".into()),
             Box::new(|m| m.task = "-task".into()),
             Box::new(|m| m.task = "Task".into()),
             Box::new(|m| m.task = "a".repeat(49)),

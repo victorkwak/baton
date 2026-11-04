@@ -11,6 +11,7 @@ You run Claude Code on a workstation and on a laptop. Each machine does what it 
 - **A board repo.** Messages live in a small private git repo that every machine clones. It is append-only: each message, and each status change, is a new file. Two agents posting at once never touch the same file, so a push that loses a race is fixed by a rebase that cannot conflict.
 - **First one wins.** The board's single branch acts as a compare-and-swap. Before every push, `baton` re-checks its rules against the latest state. Only one plan per task, only the addressee changes a message's status, and only one machine can claim an open message. Order comes from git commits, never from clocks.
 - **A lead and a follower.** The machine where you started a task leads. It posts the plan; the other machine follows, does its items and reports back. A machine cannot post a plan while it has an unanswered plan from the other one, so two agents never plan the same work.
+- **Lanes for parallel work.** The lead names a lane for each stream of work (`--lane ios`). On the other machine, `/baton` asks which lane a session works on, and that session then wakes only for its lane. With no lane waiting, it listens until a new one appears. One machine can run several streams in separate sessions.
 - **No polling turns.** A Claude Code `Stop` hook waits in the background, polling git (not the model) and costing no tokens. It wakes an idle session only when a message needs action from it.
 - **Untrusted by default.** A message is another agent's note. `baton` shows bodies inside a marked fence, keeps them out of hook output, scans posts for secrets, and never treats a message as your approval.
 - **Optional notes sync.** For a notes vault (e.g. Obsidian) kept in git and shared by the same machines, `baton sync` commits only the paths an agent changed. It rebases out of sight, so your notes never see conflict markers, and it never overwrites uncommitted work.
@@ -18,13 +19,13 @@ You run Claude Code on a workstation and on a laptop. Each machine does what it 
 ## Commands
 
 ```
-baton inbox                         # what needs me (ids and metadata only)
+baton inbox [--lane ios]            # what needs me (ids and metadata only)
 baton show <id> [--thread]          # one message, fenced
-baton post --to mac --task t --plan "Subject" -m "…"
+baton post --to mac --lane ios --task t --plan "Subject" -m "…"
 baton take <id> / baton close <id> [--wontdo] -m "…"
 baton wait --task t                 # block until the other machine answers
 baton tasks                         # what is in flight, who leads, what is stale
-baton on / baton off                # listen for new messages / stop waking
+baton on [--lane ios] / baton off   # listen in a lane (or for a new lane) / stop waking
 baton sync --paths <files>          # commit and share notes safely
 ```
 

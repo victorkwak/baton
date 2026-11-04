@@ -64,12 +64,13 @@ fn post_inbox_show_take_close_across_two_machines() {
     // The inbox carries ids and metadata, never the subject or body.
     let inbox = laptop.run(&["inbox"]).ok();
     assert!(
-        inbox.starts_with("# id\tfrom\tto\ttask\tkind\tstatus\tage\n"),
+        inbox.starts_with("# id\tfrom\tto\ttask\tkind\tstatus\tage\tlane\n"),
         "{inbox}"
     );
     let r = rows(&inbox);
     assert_eq!(r.len(), 1);
     assert_eq!(r[0][..6], [&id, "ws", "laptop", "parser", "-", "open"]);
+    assert_eq!(r[0][7], "-");
     assert!(!inbox.contains("review") && !inbox.contains("body text"));
     // The sender's inbox is empty, and empty output is nothing at all.
     assert_eq!(ws.run(&["inbox"]).ok(), "");
@@ -176,8 +177,10 @@ fn bad_fields_are_usage_errors() {
         "s",
     ])
     .code(1);
-    ws.run(&["post", "--to", "laptop", "--plan", "-m", "x", "no task"])
-        .code(1);
+    ws.run(&[
+        "post", "--to", "laptop", "--plan", "--lane", "main", "-m", "x", "no task",
+    ])
+    .code(1);
     ws.run(&["post", "--to", "laptop", "s"]).code(1);
     assert!(net.history().is_empty());
 }
@@ -225,7 +228,8 @@ fn two_racing_plans_for_one_task_exactly_one_lands() {
         let results = race(vec![ws.clone(), laptop.clone()], move |m| {
             // Addressed to the human, so only plan uniqueness decides.
             m.run(&[
-                "post", "--to", HUMAN, "--task", &task, "--plan", "-m", "x", "plan",
+                "post", "--to", HUMAN, "--task", &task, "--plan", "--lane", "main", "-m", "x",
+                "plan",
             ])
         });
         let won: Vec<_> = results.iter().filter(|r| r.code == 0).collect();
@@ -248,10 +252,14 @@ fn two_racing_plans_for_one_task_exactly_one_lands() {
 #[test]
 fn unanswered_plan_blocks_a_plan_for_another_task() {
     let (_net, ws, laptop) = pair();
-    let plan = ws.post("laptop", "plan a", &["--task", "alpha", "--plan"]);
+    let plan = ws.post(
+        "laptop",
+        "plan a",
+        &["--task", "alpha", "--plan", "--lane", "main"],
+    );
     let err = laptop
         .run(&[
-            "post", "--to", "ws", "--task", "beta", "--plan", "-m", "x", "plan b",
+            "post", "--to", "ws", "--task", "beta", "--plan", "--lane", "main", "-m", "x", "plan b",
         ])
         .code(10);
     assert!(
@@ -262,14 +270,19 @@ fn unanswered_plan_blocks_a_plan_for_another_task() {
     laptop.run(&["take", &plan]).ok();
     laptop
         .run(&[
-            "post", "--to", "ws", "--task", "beta", "--plan", "-m", "x", "plan b",
+            "post", "--to", "ws", "--task", "beta", "--plan", "--lane", "main", "-m", "x", "plan b",
         ])
         .code(10);
     laptop.post("ws", "ok, on it", &["--task", "alpha", "--reply-to", &plan]);
-    laptop.post("ws", "plan b", &["--task", "beta", "--plan"]);
+    laptop.post(
+        "ws",
+        "plan b",
+        &["--task", "beta", "--plan", "--lane", "main"],
+    );
     // Now ws must answer laptop's plan before its next one.
     ws.run(&[
-        "post", "--to", "laptop", "--task", "gamma", "--plan", "-m", "x", "plan c",
+        "post", "--to", "laptop", "--task", "gamma", "--plan", "--lane", "main", "-m", "x",
+        "plan c",
     ])
     .code(10);
 }
@@ -486,7 +499,11 @@ fn the_human_at_a_terminal_closes_and_hands_over() {
     }
     let (_net, ws, laptop) = pair();
     let id = ws.post(HUMAN, "please approve", &[]);
-    ws.post("laptop", "plan", &["--task", "t", "--plan"]);
+    ws.post(
+        "laptop",
+        "plan",
+        &["--task", "t", "--plan", "--lane", "main"],
+    );
     let mut human = ws.clone();
     human.agent = false;
     let tty = |args: &str| on_tty(&human, &[], args).unwrap();
@@ -519,7 +536,7 @@ fn the_human_at_a_terminal_closes_and_hands_over() {
     // A closed task's slug cannot be reused.
     let err = laptop
         .run(&[
-            "post", "--to", "ws", "--task", "t", "--plan", "-m", "x", "again",
+            "post", "--to", "ws", "--task", "t", "--plan", "--lane", "main", "-m", "x", "again",
         ])
         .code(10);
     assert!(err.contains("rule task-closed"), "{err}");
@@ -599,7 +616,7 @@ fn offline_plain_posts_queue_and_rule_bearing_records_are_refused() {
         "{err}"
     );
     ws.run(&[
-        "post", "--to", "laptop", "--task", "t", "--plan", "-m", "x", "plan",
+        "post", "--to", "laptop", "--task", "t", "--plan", "--lane", "main", "-m", "x", "plan",
     ])
     .code(30);
     ws.run(&["close", &for_ws]).code(30);
@@ -684,8 +701,8 @@ fn show_strips_control_characters() {
 fn json_output_shapes() {
     let (_net, ws, laptop) = pair();
     let r = ws.run(&[
-        "--format", "json", "post", "--to", "laptop", "--task", "j", "--plan", "-m", "body",
-        "subject",
+        "--format", "json", "post", "--to", "laptop", "--task", "j", "--plan", "--lane", "main",
+        "-m", "body", "subject",
     ]);
     let v = r.json();
     assert_eq!(v["command"], "post");
@@ -722,7 +739,11 @@ fn json_output_shapes() {
 #[test]
 fn tasks_show_leads_handovers_and_branch_owners() {
     let (_net, ws, laptop) = pair();
-    let plan = ws.post("laptop", "plan", &["--task", "board", "--plan"]);
+    let plan = ws.post(
+        "laptop",
+        "plan",
+        &["--task", "board", "--plan", "--lane", "main"],
+    );
     laptop.post("ws", "agreed", &["--task", "board", "--reply-to", &plan]);
     let err = laptop
         .run(&[
@@ -848,7 +869,7 @@ fn overlapping_pushes_are_rejected_and_rechecked() {
     std::fs::write(&log, "").unwrap();
     let results = race(vec![laptop.clone(), mac.clone()], |m| {
         m.run(&[
-            "post", "--to", HUMAN, "--task", "same", "--plan", "-m", "x", "plan",
+            "post", "--to", HUMAN, "--task", "same", "--plan", "--lane", "main", "-m", "x", "plan",
         ])
     });
     let pushes = std::fs::read_to_string(&log).unwrap().lines().count();
@@ -1097,4 +1118,72 @@ fn doctor_warns_about_the_ssh_agent_only_when_ssh_fails() {
     let (status, detail) = check(&ws, "ssh-agent");
     assert_eq!(status, "warn", "{detail}");
     assert!(detail.contains("ssh-add"), "{detail}");
+}
+
+#[test]
+fn lanes_follow_the_task_and_filter_the_inbox() {
+    let (_net, ws, laptop) = pair();
+    // The lead names the lane: a plan without one is refused.
+    let run = ws.run(&[
+        "post", "--to", "laptop", "--task", "t", "--plan", "-m", "x", "plan",
+    ]);
+    assert_eq!(run.code, 1, "{run:?}");
+    assert!(run.stderr.contains("--lane"), "{run:?}");
+    ws.run(&["post", "--to", "laptop", "--lane", "IOS", "-m", "x", "bad"])
+        .code(1);
+
+    let plan = ws.post(
+        "laptop",
+        "plan",
+        &["--task", "t", "--plan", "--lane", "ios"],
+    );
+    let note = ws.post("laptop", "a note", &[]);
+    let web = ws.post("laptop", "web work", &["--lane", "web"]);
+    let lane_of = |m: &Machine, id: &str| {
+        rows(&m.run(&["inbox", "--all"]).ok())
+            .into_iter()
+            .find(|r| r[0] == id)
+            .unwrap()[7]
+            .clone()
+    };
+    assert_eq!(lane_of(&laptop, &plan), "ios");
+    assert_eq!(lane_of(&laptop, &note), "-");
+
+    // `--lane` keeps one lane; `-` keeps messages without one.
+    let ids = |args: &[&str]| -> Vec<String> {
+        rows(&laptop.run(args).ok())
+            .into_iter()
+            .map(|r| r[0].clone())
+            .collect()
+    };
+    assert_eq!(ids(&["inbox", "--lane", "ios"]), vec![plan.clone()]);
+    assert_eq!(ids(&["inbox", "--lane", "-"]), vec![note.clone()]);
+    assert_eq!(ids(&["inbox"]).len(), 3);
+
+    // A message in the task, and a reply, take the task's lane...
+    let answer = laptop.post("ws", "answer", &["--task", "t", "--reply-to", &plan]);
+    assert_eq!(lane_of(&ws, &answer), "ios");
+    // ...and another lane is refused.
+    let run = laptop.run(&[
+        "post", "--to", "ws", "--task", "t", "--lane", "web", "-m", "x", "wrong",
+    ]);
+    assert_eq!(run.code, 10, "{run:?}");
+    assert!(run.stderr.contains("rule lane"), "{run:?}");
+    // Outside a task, a reply takes the replied message's lane.
+    let re = laptop.post("ws", "re web", &["--reply-to", &web]);
+    assert_eq!(lane_of(&ws, &re), "web");
+
+    // `close -m` replies keep the lane too.
+    laptop
+        .run(&["close", &web, "--wontdo", "-m", "not now"])
+        .ok();
+    let v = ws.run(&["--format", "json", "inbox"]).json();
+    let wontdo = v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["reply_to"] == web.as_str() && i["id"] != re.as_str())
+        .unwrap()
+        .clone();
+    assert_eq!(wontdo["lane"], "web");
 }

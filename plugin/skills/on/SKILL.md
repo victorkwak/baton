@@ -9,4 +9,4 @@ allowed-tools: Bash(baton on:*)
 
 Run `baton on` and report its output in one line.
 
-When this turn ends, the session listens: any new message for this machine (new plans too) wakes it when it is idle, until `/baton:off`. `/baton` does the same and also shows what waits now.
+When this turn ends, the session listens again in the lane it had: new messages for this machine in that lane wake it when it is idle, until `/baton:off`. A session in the lobby (lane `-`) wakes only when a new lane appears. `/baton` does the same and also shows what waits now, or asks which lane to work on.

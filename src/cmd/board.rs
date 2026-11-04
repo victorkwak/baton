@@ -11,15 +11,15 @@ use clap::{Args, Subcommand};
 use serde_json::{Value, json};
 
 use crate::Format;
-use crate::board::{MsgState, State, age_secs, format_age};
+use crate::board::{MsgState, State, age_secs, format_age, lane_name};
 use crate::config::Config;
 use crate::error::{Error, Kind, Result};
 use crate::identity::Who;
 use crate::out;
 use crate::output::{envelope, field, sanitize};
 use crate::record::{
-    Event, LeadEvent, Message, MsgKind, Record, Status, StatusEvent, check_id, new_id, now,
-    random_u64,
+    Event, LeadEvent, Message, MsgKind, Record, Status, StatusEvent, check_id, check_lane, new_id,
+    now, random_u64,
 };
 use crate::secrets;
 use crate::store::Store;
@@ -29,6 +29,9 @@ pub struct InboxArgs {
     /// Every open message, not only this machine's.
     #[arg(long)]
     pub all: bool,
+    /// Only this lane (`-`: messages without a lane).
+    #[arg(long)]
+    pub lane: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -44,6 +47,10 @@ pub struct PostArgs {
     /// A machine, the human, or `any`.
     #[arg(long)]
     pub to: String,
+    /// The stream of work. A plan needs one; a message in a task or a
+    /// reply gets its task's or the replied message's lane.
+    #[arg(long)]
+    pub lane: Option<String>,
     #[arg(long)]
     pub task: Option<String>,
     /// The first message of a task.
@@ -138,6 +145,15 @@ fn norm_id(id: &str) -> Result<String> {
     Ok(id)
 }
 
+/// A `--lane` value: a lane, or `-` for none (empty).
+pub fn lane_arg(s: &str) -> Result<String> {
+    if s == "-" {
+        return Ok(String::new());
+    }
+    check_lane(s)?;
+    Ok(s.to_owned())
+}
+
 fn or_dash(s: &str) -> String {
     if s.is_empty() {
         "-".to_owned()
@@ -147,7 +163,7 @@ fn or_dash(s: &str) -> String {
 }
 
 /// The `inbox` header (also used by `wait`).
-pub const INBOX_HEADER: &str = "# id\tfrom\tto\ttask\tkind\tstatus\tage";
+pub const INBOX_HEADER: &str = "# id\tfrom\tto\ttask\tkind\tstatus\tage\tlane";
 
 /// One `inbox` line: ids and metadata only, never subject or body.
 pub fn inbox_line(m: &MsgState, now: jiff::Timestamp) -> String {
@@ -159,6 +175,7 @@ pub fn inbox_line(m: &MsgState, now: jiff::Timestamp) -> String {
         or_dash(m.msg.kind.as_str()),
         m.status.to_string(),
         format_age(age_secs(&m.msg.at, now)),
+        or_dash(&m.msg.lane),
     ]
     .join("\t")
 }
@@ -169,6 +186,7 @@ pub fn inbox_json(m: &MsgState, now: jiff::Timestamp) -> Value {
         "id": m.msg.id,
         "from": m.msg.from,
         "to": m.msg.to,
+        "lane": m.msg.lane,
         "task": m.msg.task,
         "kind": m.msg.kind.as_str(),
         "status": m.status.as_str(),
@@ -228,7 +246,13 @@ pub fn inbox(format: Format, args: InboxArgs) -> Result<()> {
     let _lock = c.store.lock()?;
     let snap = fetch_read_deliver(&c.store)?;
     warn_rejected(&snap.state);
-    let msgs = snap.state.inbox(c.who.machine(), args.all);
+    let lane = args.lane.as_deref().map(lane_arg).transpose()?;
+    let msgs: Vec<&MsgState> = snap
+        .state
+        .inbox(c.who.machine(), args.all)
+        .into_iter()
+        .filter(|m| lane.as_ref().is_none_or(|l| &m.msg.lane == l))
+        .collect();
     print_messages(format, "inbox", &msgs);
     Ok(())
 }
@@ -269,7 +293,7 @@ pub fn show(format: Format, args: ShowArgs) -> Result<()> {
         }
         Format::Text => {
             let nonce = nonce(&msgs);
-            out!("# id\tfrom\tto\ttask\tkind\tstatus\tage\treply_to\tbranch\trelated");
+            out!("{INBOX_HEADER}\treply_to\tbranch\trelated");
             for m in msgs {
                 let related = m
                     .msg
@@ -377,6 +401,15 @@ fn post_as(format: Format, args: PostArgs, allow_secret: bool) -> Result<()> {
     } else {
         MsgKind::Plain
     };
+    if let Some(l) = &args.lane {
+        check_lane(l)?;
+    }
+    if kind == MsgKind::Plan && args.lane.is_none() {
+        crate::fail!(
+            Internal,
+            "a plan needs --lane: the stream of work the other machine's session picks (`docs/design.md`, \"Lanes\")"
+        );
+    }
     let body = read_body(&args)?;
     let reply_to = args.reply_to.as_deref().map(norm_id).transpose()?;
     let msg = Message {
@@ -384,6 +417,7 @@ fn post_as(format: Format, args: PostArgs, allow_secret: bool) -> Result<()> {
         at: now(),
         from: c.who.from().to_owned(),
         to: args.to.clone(),
+        lane: args.lane.clone().unwrap_or_default(),
         task: args.task.clone().unwrap_or_default(),
         kind,
         reply_to: reply_to.unwrap_or_default(),
@@ -407,12 +441,26 @@ fn post_as(format: Format, args: PostArgs, allow_secret: bool) -> Result<()> {
         )?;
     }
     let _lock = c.store.lock()?;
-    let rec = Record::Message(msg.clone());
     let summary = match kind {
         MsgKind::Plain => format!("post {}", msg.id),
         k => format!("{} {} (task {})", k.as_str(), msg.id, msg.task),
     };
-    let w = c.store.push_cas(&summary, |_| Ok(vec![rec.clone()]))?;
+    let w = c.store.push_cas(&summary, |state| {
+        // The task's lane, else the replied message's: filled in when
+        // `--lane` is left out, refused when it differs.
+        let mut m = msg.clone();
+        if let Some(want) = state.lane_for(kind, &m.task, &m.reply_to) {
+            match &args.lane {
+                Some(l) if l != want => crate::fail!(
+                    Rule,
+                    "rule lane: the message must be in lane {} (its task's or the replied message's), not {l}",
+                    lane_name(want)
+                ),
+                _ => m.lane = want.to_owned(),
+            }
+        }
+        Ok(vec![Record::Message(m)])
+    })?;
     crate::hooks::arm_or_warn(&c.store, &[&msg.id, &msg.reply_to]);
     print_written(format, "post", &msg.id, &w);
     Ok(())
@@ -496,6 +544,10 @@ fn close_with(format: Format, c: &Ctx, args: CloseArgs) -> Result<()> {
                     at: at.clone(),
                     from: c.who.from().to_owned(),
                     to: orig.msg.from.clone(),
+                    lane: state
+                        .lane_for(MsgKind::Plain, &orig.msg.task, &id)
+                        .unwrap_or_default()
+                        .to_owned(),
                     task: orig.msg.task.clone(),
                     kind: MsgKind::Plain,
                     reply_to: id.clone(),
@@ -711,15 +763,16 @@ pub fn human(format: Format, cmd: HumanCommand) -> Result<()> {
             let id = new_id();
             let at = now();
             let w = c.store.push_cas(&format!("close-task {task}"), |state| {
-                let lead = state
-                    .task(&task)
-                    .map(|t| t.lead.clone())
-                    .unwrap_or_else(|| c.config.machine.clone());
+                let (lead, lane) = state.task(&task).map_or_else(
+                    || (c.config.machine.clone(), String::new()),
+                    |t| (t.lead.clone(), t.lane.clone()),
+                );
                 Ok(vec![Record::Message(Message {
                     id: id.clone(),
                     at: at.clone(),
                     from: c.who.from().to_owned(),
                     to: lead,
+                    lane,
                     task: task.clone(),
                     kind: MsgKind::CloseTask,
                     reply_to: String::new(),

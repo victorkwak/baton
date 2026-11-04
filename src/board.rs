@@ -65,6 +65,8 @@ pub struct TaskState {
     pub task: String,
     pub plan: String,
     pub lead: String,
+    /// The plan's lane; every message in the task carries it.
+    pub lane: String,
     pub closed: bool,
     /// `repo:branch` keys handed over within this task.
     pub branches: Vec<String>,
@@ -220,6 +222,18 @@ impl State {
         if !m.reply_to.is_empty() && !self.msgs.contains_key(&m.reply_to) {
             return Err(unknown(&m.reply_to));
         }
+        if let Some(want) = self.required_lane(m.kind, &m.task, &m.reply_to)
+            && m.lane != want
+        {
+            return Err(rule(
+                "lane",
+                format!(
+                    "the message must be in lane {} (its task's or the replied message's), not {}",
+                    lane_name(want),
+                    lane_name(&m.lane)
+                ),
+            ));
+        }
         match m.kind {
             MsgKind::Plain => Ok(()),
             MsgKind::Plan => self.check_plan(m),
@@ -245,6 +259,55 @@ impl State {
                 self.check_lead_or_human(t, &m.from, "close")
             }
         }
+    }
+
+    /// The lane `post` gives a new message: its planned task's, else the
+    /// lane of the message it replies to. `None`: any lane (a plan starts one).
+    pub fn lane_for(&self, kind: MsgKind, task: &str, reply_to: &str) -> Option<&str> {
+        if kind == MsgKind::Plan {
+            return None;
+        }
+        if let Some(t) = self.tasks.get(task) {
+            return Some(&t.lane);
+        }
+        self.msgs.get(reply_to).map(|p| p.msg.lane.as_str())
+    }
+
+    /// The part of [`State::lane_for`] that is a board rule: only answers
+    /// that cannot change later. A handover or close-task needs an open
+    /// task, re-checked on every retry. A plain message outside a task
+    /// takes its replied message's lane, which never changes. A plain
+    /// message in a task is left to `post`: its task's plan may land in the
+    /// same race, and `push_cas` does not re-check plain messages on a retry.
+    fn required_lane(&self, kind: MsgKind, task: &str, reply_to: &str) -> Option<&str> {
+        match kind {
+            MsgKind::Plan => None,
+            MsgKind::Handover | MsgKind::CloseTask => self.tasks.get(task).map(|t| t.lane.as_str()),
+            MsgKind::Plain if !task.is_empty() => None,
+            MsgKind::Plain => self.msgs.get(reply_to).map(|p| p.msg.lane.as_str()),
+        }
+    }
+
+    /// Does `m` open its lane for `machine`? It is new work in a lane (a
+    /// plan, or a message that is neither a reply nor in a planned task),
+    /// with no other open or working message for `machine` in that lane
+    /// before it. A listening session in the lobby wakes only for these. A
+    /// reply never opens a lane: on the lead's side, it belongs to the
+    /// session armed for its task.
+    pub fn opens_lane(&self, m: &MsgState, machine: &str) -> bool {
+        let new_work = m.msg.reply_to.is_empty()
+            && (m.msg.kind == MsgKind::Plan || !self.tasks.contains_key(&m.msg.task));
+        new_work
+            && !m.msg.lane.is_empty()
+            && !self.messages().any(|n| {
+                n.seq < m.seq
+                    && n.msg.lane == m.msg.lane
+                    && !n.status.is_closed()
+                    && n.msg.from != machine
+                    && (n.msg.to == machine
+                        || (n.msg.to == "any"
+                            && n.claimed_by.as_deref().is_none_or(|c| c == machine)))
+            })
     }
 
     fn check_plan(&self, m: &Message) -> Result<()> {
@@ -423,6 +486,7 @@ impl State {
                                 task: m.task.clone(),
                                 plan: m.id.clone(),
                                 lead: m.from.clone(),
+                                lane: m.lane.clone(),
                                 closed: false,
                                 branches: Vec::new(),
                             },
@@ -592,6 +656,11 @@ pub struct TaskSummary<'a> {
     pub branches: Vec<(String, String)>,
 }
 
+/// A lane as shown: `-` for none.
+pub fn lane_name(lane: &str) -> &str {
+    if lane.is_empty() { "-" } else { lane }
+}
+
 /// Seconds since `at` (0 when unparsable or in the future).
 pub fn age_secs(at: &str, now: jiff::Timestamp) -> i64 {
     parse_at(at).map_or(0, |t| (now.as_second() - t.as_second()).max(0))
@@ -620,6 +689,7 @@ mod tests {
             at: now(),
             from: from.into(),
             to: to.into(),
+            lane: String::new(),
             task: task.into(),
             kind,
             reply_to: String::new(),
@@ -688,6 +758,87 @@ mod tests {
                 .unwrap()
                 .to_owned()
         }
+    }
+
+    fn in_lane(mut m: Message, lane: &str) -> Message {
+        m.lane = lane.into();
+        m
+    }
+
+    #[test]
+    fn a_task_and_a_reply_keep_their_lane() {
+        let mut b = Board::new();
+        let plan = in_lane(msg("ws", "laptop", "t1", MsgKind::Plan), "ios");
+        b.post(&plan).unwrap();
+        assert_eq!(b.state.task("t1").unwrap().lane, "ios");
+        // `post` gives a task message the plan's lane.
+        assert_eq!(
+            b.state.lane_for(MsgKind::Plain, "t1", &plan.id),
+            Some("ios")
+        );
+        // The board refuses another lane on a handover or close-task.
+        let wrong = in_lane(msg("ws", "laptop", "t1", MsgKind::Handover), "web");
+        assert_eq!(Board::rule_of(b.post(&wrong)), "lane");
+        let wrong = msg("ws", "laptop", "t1", MsgKind::CloseTask);
+        assert_eq!(Board::rule_of(b.post(&wrong)), "lane");
+        b.post(&in_lane(reply("laptop", &b.ms(&plan)), "ios"))
+            .unwrap();
+        // Outside a task, a reply takes the replied message's lane.
+        let note = in_lane(msg("ws", "laptop", "", MsgKind::Plain), "web");
+        b.post(&note).unwrap();
+        assert_eq!(
+            Board::rule_of(b.post(&reply("laptop", &b.ms(&note)))),
+            "lane"
+        );
+        b.post(&in_lane(reply("laptop", &b.ms(&note)), "web"))
+            .unwrap();
+        // A message with neither picks freely; so does a new plan.
+        b.post(&in_lane(msg("ws", "laptop", "", MsgKind::Plain), "x"))
+            .unwrap();
+        b.post(&in_lane(msg("ws", "any", "t2", MsgKind::Plan), "y"))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_message_opens_its_lane_when_the_lane_has_no_open_work() {
+        let mut b = Board::new();
+        let first = in_lane(msg("ws", "laptop", "", MsgKind::Plain), "ios");
+        let second = in_lane(msg("ws", "laptop", "", MsgKind::Plain), "ios");
+        let other = in_lane(msg("ws", "laptop", "", MsgKind::Plain), "web");
+        let none = msg("ws", "laptop", "", MsgKind::Plain);
+        for m in [&first, &second, &other, &none] {
+            b.post(m).unwrap();
+        }
+        let opens = |b: &Board, m: &Message| b.state.opens_lane(&b.ms(m), "laptop");
+        assert!(opens(&b, &first) && opens(&b, &other));
+        assert!(!opens(&b, &second), "ios already has open work");
+        assert!(!opens(&b, &none), "no lane opens nothing");
+        // Once the earlier work is closed, the lane counts as new again.
+        b.commit(vec![status("laptop", &first.id, Status::Done)])
+            .unwrap();
+        assert!(opens(&b, &second));
+        // Work addressed to another machine does not hold the lane open:
+        // ws's open ios message to laptop leaves ios new for ws.
+        let back = in_lane(msg("laptop", "ws", "", MsgKind::Plain), "ios");
+        b.post(&back).unwrap();
+        assert!(b.state.opens_lane(&b.ms(&back), "ws"));
+    }
+
+    #[test]
+    fn only_new_work_opens_a_lane() {
+        let mut b = Board::new();
+        let plan = in_lane(msg("ws", "laptop", "t1", MsgKind::Plan), "ios");
+        b.post(&plan).unwrap();
+        assert!(b.state.opens_lane(&b.ms(&plan), "laptop"));
+        // The follower's reply reaches the lead's machine in lane ios, with
+        // nothing else open there: it is still not new work for ws.
+        let answer = in_lane(reply("laptop", &b.ms(&plan)), "ios");
+        b.post(&answer).unwrap();
+        assert!(!b.state.opens_lane(&b.ms(&answer), "ws"));
+        // Nor is a later message in the planned task.
+        let more = in_lane(msg("laptop", "ws", "t1", MsgKind::Plain), "ios");
+        b.post(&more).unwrap();
+        assert!(!b.state.opens_lane(&b.ms(&more), "ws"));
     }
 
     #[test]

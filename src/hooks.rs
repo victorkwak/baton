@@ -94,6 +94,11 @@ pub struct Arming {
     /// too, until `baton off`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen: Option<usize>,
+    /// The lane a listening session is bound to; empty: the lobby, which
+    /// wakes only for a message that opens a lane (`docs/design.md`,
+    /// "Lanes"). Kept through `baton off`, so `baton on` resumes it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub lane: String,
     /// `baton off`: never wake this session, until `baton on`. Arming
     /// still records tasks and messages, so `on` resumes them.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -125,6 +130,9 @@ impl Arming {
             *e = (*e).max(*v);
         }
         self.off |= other.off;
+        if self.lane.is_empty() {
+            self.lane = other.lane.clone();
+        }
         self.listen = match (self.listen, other.listen) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -298,13 +306,14 @@ pub fn arm(store: &Store, ids: &[&str]) -> Result<()> {
 
 /// Turn listening on from board position `listen` (`Some`), or waking off
 /// (`None`), for this agent session, under every key its environment names
-/// and every key it was armed under. A session already listening keeps its
-/// earlier position. Returns those keys; empty outside Claude Code or
-/// without a session key.
-pub fn set_listen(listen: Option<usize>) -> Result<Vec<String>> {
+/// and every key it was armed under. `lane`: bind to that lane (empty: the
+/// lobby); `None` keeps the session's lane. A session already listening in
+/// the same lane keeps its earlier position. Returns those keys and the
+/// lane; no keys outside Claude Code or without a session key.
+pub fn set_listen(listen: Option<usize>, lane: Option<&str>) -> Result<(Vec<String>, String)> {
     let mut keys = env_keys();
     if !crate::identity::is_agent() || keys.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), String::new()));
     }
     let dir = sessions_dir()?;
     std::fs::create_dir_all(&dir)?;
@@ -314,23 +323,26 @@ pub fn set_listen(listen: Option<usize>) -> Result<Vec<String>> {
         .write(true)
         .open(dir.join("arming.lock"))?;
     lock.lock()?;
-    for k in Arming::load_all(&keys)?.keys {
+    let current = Arming::load_all(&keys)?;
+    for k in current.keys {
         if valid_key(&k) && !keys.contains(&k) {
             keys.push(k);
         }
     }
+    let lane = lane.map_or(current.lane, str::to_owned);
     for key in &keys {
         let mut a = Arming::load(key)?;
         a.off = listen.is_none();
         a.listen = match (listen, a.listen) {
-            (Some(new), Some(old)) => Some(new.min(old)),
+            (Some(new), Some(old)) if a.lane == lane => Some(new.min(old)),
             (new, _) => new,
         };
+        a.lane = lane.clone();
         a.keys.extend(keys.iter().cloned());
         let text = serde_json::to_vec_pretty(&a).map_err(anyhow::Error::from)?;
         write_atomic(&Arming::path(key)?, &text)?;
     }
-    Ok(keys)
+    Ok((keys, lane))
 }
 
 /// Remove session files (arming, waiter state, generation) not written
