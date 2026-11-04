@@ -25,7 +25,8 @@ baton post --to mac --lane looks-share-sheet --task t --plan "Subject" -m "…"
 baton take <id> / baton close <id> [--wontdo] -m "…"
 baton wait --task t                 # block until the other machine answers
 baton tasks                         # what is in flight, who leads, what is stale
-baton on [--lane L] / baton off     # listen in a lane (or for a new lane) / stop waking
+baton on [--lane L] [--idle 4h]     # listen in a lane (or for a new lane); stop after 1h idle by default
+baton off                           # stop waking
 baton sync --paths <files>          # commit and share notes safely
 ```
 

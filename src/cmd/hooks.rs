@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::board::{MsgState, State};
 use crate::cmd::board::poll_interval;
-use crate::config::Config;
+use crate::config::{Config, format_idle, parse_idle};
 use crate::error::Result;
 use crate::hooks::{ARMING_TTL_SECS, Arming, Parent, hook_keys, sessions_dir, write_atomic};
 use crate::output::field;
@@ -24,7 +24,7 @@ use crate::store::Store;
 #[derive(Debug, Subcommand)]
 pub enum HookCommand {
     /// Stop (asyncRewake): wait for an actionable message; exit 2 to wake.
-    Wait,
+    Wait(WaitArgs),
     /// Removed (Claude Code permissions protect); a no-op kept so an old
     /// `PreToolUse` hook does not fail every tool call.
     #[command(hide = true)]
@@ -33,9 +33,17 @@ pub enum HookCommand {
 
 pub fn hook(cmd: HookCommand) -> Result<()> {
     match cmd {
-        HookCommand::Wait => wait(),
+        HookCommand::Wait(a) => wait(a),
         HookCommand::Guard => Ok(()),
     }
+}
+
+#[derive(Debug, clap::Args)]
+pub struct WaitArgs {
+    /// The Stop hook's `timeout` in seconds. Without it: 3600, the timeout
+    /// of a hook from before this flag.
+    #[arg(long)]
+    pub timeout: Option<u64>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -44,6 +52,11 @@ pub struct OnArgs {
     /// a new lane). Without it the session keeps its lane.
     #[arg(long)]
     pub lane: Option<String>,
+    /// Stop listening after this long without a turn: a duration (`90m`,
+    /// `4h`), `never`, or `default` (the config's `idle`, else 1h).
+    /// Without it the session keeps its limit.
+    #[arg(long)]
+    pub idle: Option<String>,
 }
 
 /// `baton on` / `baton off`: listen for new messages to this machine in
@@ -56,6 +69,12 @@ pub fn set_waking(format: crate::Format, on: Option<OnArgs>) -> Result<()> {
         .and_then(|a| a.lane.as_deref())
         .map(crate::cmd::board::lane_arg)
         .transpose()?;
+    // `Some(None)`: back to the config's limit.
+    let idle = match on.as_ref().and_then(|a| a.idle.as_deref()) {
+        None => None,
+        Some("default") => Some(None),
+        Some(s) => Some(Some(format_idle(parse_idle(s)?))),
+    };
     let on = on.is_some();
     let name = if on { "on" } else { "off" };
     if !crate::identity::is_agent() || crate::hooks::env_keys().is_empty() {
@@ -75,7 +94,13 @@ pub fn set_waking(format: crate::Format, on: Option<OnArgs>) -> Result<()> {
     } else {
         None
     };
-    let (keys, lane) = crate::hooks::set_listen(listen, lane.as_deref())?;
+    let (keys, arming) = crate::hooks::set_listen(listen, lane.as_deref(), idle)?;
+    let lane = arming.lane.clone();
+    let idle = session_idle(&arming, &config)?;
+    let until = match idle {
+        None => "until `baton off`".to_owned(),
+        Some(_) => format!("until `baton off` or {} without a turn", format_idle(idle)),
+    };
     let primary = keys.first().cloned().unwrap_or_default();
     if !on {
         let dir = sessions_dir()?;
@@ -88,15 +113,15 @@ pub fn set_waking(format: crate::Format, on: Option<OnArgs>) -> Result<()> {
             "{}",
             crate::output::envelope(
                 name,
-                serde_json::json!([{"session": primary, "listening": on, "lane": lane}])
+                serde_json::json!([{"session": primary, "listening": on, "lane": lane, "idle": format_idle(idle)}])
             )
         ),
         crate::Format::Text if on && lane.is_empty() => crate::out!(
-            "baton: listening in lane -: a message for {} that opens a new lane wakes this session when it is idle, until `baton off`",
+            "baton: listening in lane -: a message for {} that opens a new lane wakes this session when it is idle, {until}",
             config.machine
         ),
         crate::Format::Text if on => crate::out!(
-            "baton: listening in lane {lane}: a new message for {} in lane {lane} wakes this session when it is idle, until `baton off`",
+            "baton: listening in lane {lane}: a new message for {} in lane {lane} wakes this session when it is idle, {until}",
             config.machine
         ),
         crate::Format::Text => crate::out!(
@@ -104,6 +129,16 @@ pub fn set_waking(format: crate::Format, on: Option<OnArgs>) -> Result<()> {
         ),
     }
     Ok(())
+}
+
+/// The session's idle limit (`None`: never): its own from `baton on
+/// --idle`, else the config's. A session limit that no longer parses
+/// falls back to the config's.
+fn session_idle(arming: &Arming, config: &Config) -> Result<Option<Duration>> {
+    match arming.idle.as_deref().map(parse_idle) {
+        Some(Ok(idle)) => Ok(idle),
+        _ => config.idle(),
+    }
 }
 
 /// The fields of the waiter's stdin JSON that `baton` reads.
@@ -313,14 +348,17 @@ fn unix_now() -> i64 {
 
 /// The `Stop` waiter (`docs/design.md`, "The waiter"). Exits 0 when there
 /// is nothing to wait for, a newer waiter (a later `Stop`) took over the
-/// session, or one minute before the hook's timeout; exits 2 with the wake
-/// line on stderr.
-fn wait() -> Result<()> {
+/// session, the session's idle limit has passed since this `Stop`, or one
+/// minute before the hook's timeout; exits 2 with the wake line on stderr.
+fn wait(args: WaitArgs) -> Result<()> {
     let start = Instant::now();
     let parent = Parent::at_start();
-    let total = env_secs("BATON_HOOK_TIMEOUT_SECS", 3600);
+    let total = match args.timeout {
+        Some(t) => Duration::from_secs(t),
+        None => env_secs("BATON_HOOK_TIMEOUT_SECS", 3600),
+    };
     let margin = env_secs("BATON_HOOK_MARGIN_SECS", 60);
-    let deadline = start + total.saturating_sub(margin);
+    let mut deadline = start + total.saturating_sub(margin);
     // Longest wait between polls while git keeps failing.
     let max_backoff = env_secs("BATON_MAX_BACKOFF_SECS", 300).max(Duration::from_secs(1));
     let gap = env_secs("BATON_WAKE_GAP_SECS", 120).as_secs() as i64;
@@ -361,13 +399,18 @@ fn wait() -> Result<()> {
     if armed.is_empty() || armed.off {
         return Ok(());
     }
+    let config = Config::load()?;
+    // Idle: no turn since this `Stop`. A wake starts a turn, and its
+    // `Stop` a new waiter with a new limit.
+    if let Some(idle) = session_idle(&armed, &config)? {
+        deadline = deadline.min(start + idle);
+    }
     // Keys the session was also armed under (e.g. its id before a restart).
     for k in armed.keys {
         if crate::hooks::valid_key(&k) && !keys.contains(&k) {
             keys.push(k);
         }
     }
-    let config = Config::load()?;
     let store = Store::open(&config, &primary)?;
     let mut ws = WaitState::load(&dir, &keys);
     // Fetch at the start of the next round (the tip moved, or a fetch failed).

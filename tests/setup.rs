@@ -68,8 +68,14 @@ fn init_writes_config_clones_and_prints_settings() {
     let s = settings_block(&out);
     let stop = &s["hooks"]["Stop"][0]["hooks"][0];
     assert_eq!(stop["asyncRewake"], true);
-    assert_eq!(stop["timeout"], 3600);
-    assert!(stop["command"].as_str().unwrap().ends_with(" hook wait"));
+    // Claude Code's timeout, also passed to the waiter: 7 days.
+    assert_eq!(stop["timeout"], 604800);
+    assert!(
+        stop["command"]
+            .as_str()
+            .unwrap()
+            .ends_with(" hook wait --timeout 604800")
+    );
     assert!(s["hooks"].get("PreToolUse").is_none(), "{s}");
     let deny = s["permissions"]["deny"][0].as_str().unwrap();
     assert!(
@@ -300,6 +306,20 @@ fn doctor_reports_each_check() {
     std::fs::write(claude.join("settings.json"), s.to_string()).unwrap();
     let rows = doctor_rows(&m.run(&["doctor"]).ok());
     assert_eq!(status_of(&rows, "hook-guard"), "warn", "{rows:?}");
+
+    // A Stop hook from before `--timeout` (3600) warns: it caps the idle
+    // limit at an hour. So does a timeout the waiter does not know.
+    for (command, timeout) in [
+        ("baton hook wait", 3600),
+        ("baton hook wait --timeout 604800", 3600),
+    ] {
+        let mut s = settings_block(&out);
+        s["hooks"]["Stop"][0]["hooks"][0]["command"] = Value::from(command);
+        s["hooks"]["Stop"][0]["hooks"][0]["timeout"] = Value::from(timeout);
+        std::fs::write(claude.join("settings.json"), s.to_string()).unwrap();
+        let rows = doctor_rows(&m.run(&["doctor"]).ok());
+        assert_eq!(status_of(&rows, "hook-wait"), "warn", "{command}: {rows:?}");
+    }
 
     // A Stop hook without asyncRewake fails; an interrupted sync warns.
     let mut s = settings_block(&out);

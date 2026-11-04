@@ -2,6 +2,17 @@
 
 All notable changes to `baton` (crate `baton-touch`). Versions follow [Semantic Versioning](https://semver.org/); before 1.0, a breaking change bumps the minor version.
 
+## [0.2.3] - 2026-11-03
+
+### Added
+
+- **Idle limit**: a listening session stops listening after it has been idle (no turn) for one hour by default. The config's `idle` sets it per machine (`idle = "4h"`, `idle = "never"`); `baton on --idle 4h|never|default` sets it per session, kept through `baton off`. The human's next message in the session resumes listening, and the waiter then wakes for what arrived meanwhile. `baton on` prints the limit; `baton doctor` shows the machine's.
+- `baton hook wait --timeout SECS`: the waiter learns its hook's timeout. Without the flag it assumes 3600, the timeout of a hook from earlier versions.
+
+### Changed
+
+- `baton init` prints the Stop hook with `"timeout": 604800` (7 days) and `hook wait --timeout 604800`, so an idle limit above one hour works. Apply it to `~/.claude/settings.json`: with the old hook, Claude Code still ends every waiter after an hour, and `baton doctor` warns.
+
 ## [0.2.2] - 2026-11-03
 
 ### Changed

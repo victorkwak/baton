@@ -99,6 +99,10 @@ pub struct Arming {
     /// "Lanes"). Kept through `baton off`, so `baton on` resumes it.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub lane: String,
+    /// `baton on --idle`: this session's idle limit (`90m`, `never`),
+    /// over the config's. Kept through `baton off`, like the lane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle: Option<String>,
     /// `baton off`: never wake this session, until `baton on`. Arming
     /// still records tasks and messages, so `on` resumes them.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -108,6 +112,11 @@ pub struct Arming {
 /// How long arming lasts without a task to end it, and how old a session
 /// file may get before it is pruned: 7 days.
 pub const ARMING_TTL_SECS: i64 = 7 * 24 * 3600;
+
+/// The `Stop` hook's `timeout` that `baton init` prints, passed to the
+/// waiter as `hook wait --timeout`: the longest any waiter can listen, so
+/// an idle limit of `never` means 7 days.
+pub const HOOK_TIMEOUT_SECS: u64 = 7 * 24 * 3600;
 
 impl Arming {
     pub fn is_empty(&self) -> bool {
@@ -132,6 +141,9 @@ impl Arming {
         self.off |= other.off;
         if self.lane.is_empty() {
             self.lane = other.lane.clone();
+        }
+        if self.idle.is_none() {
+            self.idle = other.idle.clone();
         }
         self.listen = match (self.listen, other.listen) {
             (Some(a), Some(b)) => Some(a.min(b)),
@@ -307,13 +319,19 @@ pub fn arm(store: &Store, ids: &[&str]) -> Result<()> {
 /// Turn listening on from board position `listen` (`Some`), or waking off
 /// (`None`), for this agent session, under every key its environment names
 /// and every key it was armed under. `lane`: bind to that lane (empty: the
-/// lobby); `None` keeps the session's lane. A session already listening in
-/// the same lane keeps its earlier position. Returns those keys and the
-/// lane; no keys outside Claude Code or without a session key.
-pub fn set_listen(listen: Option<usize>, lane: Option<&str>) -> Result<(Vec<String>, String)> {
+/// lobby); `None` keeps the session's lane. `idle`: `Some` sets the
+/// session's idle limit (`Some(None)`: back to the config's); `None` keeps
+/// it. A session already listening in the same lane keeps its earlier
+/// position. Returns those keys and the session's arming as written; no
+/// keys outside Claude Code or without a session key.
+pub fn set_listen(
+    listen: Option<usize>,
+    lane: Option<&str>,
+    idle: Option<Option<String>>,
+) -> Result<(Vec<String>, Arming)> {
     let mut keys = env_keys();
     if !crate::identity::is_agent() || keys.is_empty() {
-        return Ok((Vec::new(), String::new()));
+        return Ok((Vec::new(), Arming::default()));
     }
     let dir = sessions_dir()?;
     std::fs::create_dir_all(&dir)?;
@@ -330,6 +348,8 @@ pub fn set_listen(listen: Option<usize>, lane: Option<&str>) -> Result<(Vec<Stri
         }
     }
     let lane = lane.map_or(current.lane, str::to_owned);
+    let idle = idle.unwrap_or(current.idle);
+    let mut merged = Arming::default();
     for key in &keys {
         let mut a = Arming::load(key)?;
         a.off = listen.is_none();
@@ -338,11 +358,13 @@ pub fn set_listen(listen: Option<usize>, lane: Option<&str>) -> Result<(Vec<Stri
             (new, _) => new,
         };
         a.lane = lane.clone();
+        a.idle = idle.clone();
         a.keys.extend(keys.iter().cloned());
         let text = serde_json::to_vec_pretty(&a).map_err(anyhow::Error::from)?;
         write_atomic(&Arming::path(key)?, &text)?;
+        merged.merge(&a);
     }
-    Ok((keys, lane))
+    Ok((keys, merged))
 }
 
 /// Remove session files (arming, waiter state, generation) not written

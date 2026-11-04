@@ -15,7 +15,7 @@ use crate::Format;
 use crate::config::{Config, Notes, config_dir, home};
 use crate::error::{Error, Kind, Result};
 use crate::git::Git;
-use crate::hooks::sessions_dir;
+use crate::hooks::{HOOK_TIMEOUT_SECS, sessions_dir};
 use crate::out;
 use crate::output::envelope;
 use crate::store::Store;
@@ -90,9 +90,9 @@ pub fn claude_settings(exe: &Path, board: &Path) -> Value {
             "Stop": [{
                 "hooks": [{
                     "type": "command",
-                    "command": format!("{bin} hook wait"),
+                    "command": format!("{bin} hook wait --timeout {HOOK_TIMEOUT_SECS}"),
                     "asyncRewake": true,
-                    "timeout": 3600
+                    "timeout": HOOK_TIMEOUT_SECS
                 }]
             }]
         },
@@ -211,6 +211,7 @@ pub fn init(args: InitArgs) -> Result<()> {
         human: args.human.clone(),
         board: args.board.clone(),
         board_clone: None,
+        idle: None,
         notes: args.notes.as_ref().map(|repo| Notes {
             repo: repo.clone(),
             check: args.notes_check.clone(),
@@ -386,6 +387,22 @@ fn is_baton(h: &Value, sub: &str) -> bool {
         .is_some_and(|c| c.contains("baton") && c.contains(sub))
 }
 
+/// The waiter's idea of its hook's timeout: `hook wait --timeout <secs>`,
+/// else 3600 (a hook from before that flag).
+fn hook_timeout_arg(h: &Value) -> Option<u64> {
+    let cmd = h["command"].as_str()?;
+    let mut words = cmd.split_whitespace();
+    while let Some(w) = words.next() {
+        if w == "--timeout" {
+            return words.next()?.parse().ok();
+        }
+        if let Some(v) = w.strip_prefix("--timeout=") {
+            return v.parse().ok();
+        }
+    }
+    Some(3600)
+}
+
 /// The program of a hook command, when it is an absolute path that is missing.
 fn missing_program(h: &Value) -> Option<String> {
     let cmd = h["command"].as_str()?;
@@ -435,11 +452,19 @@ fn check_hooks(r: &mut Report) {
                     "hook-wait",
                     "the Stop hook needs \"asyncRewake\": true (without it the session blocks)",
                 );
-            } else if h["timeout"].as_u64() != Some(3600) {
+            } else if hook_timeout_arg(h) != h["timeout"].as_u64().or(Some(600)) {
                 r.add(
                     Status::Warn,
                     "hook-wait",
-                    "the Stop hook's timeout is not 3600; the waiter stops one minute before an hour",
+                    "the Stop hook's timeout and its `hook wait --timeout` differ: Claude Code may end the waiter early. Apply the Stop hook that `baton init` prints",
+                );
+            } else if h["timeout"].as_u64() < Some(HOOK_TIMEOUT_SECS) {
+                r.add(
+                    Status::Warn,
+                    "hook-wait",
+                    format!(
+                        "the Stop hook's timeout is below {HOOK_TIMEOUT_SECS}: a session stops listening by then, whatever its idle limit. Apply the Stop hook that `baton init` prints"
+                    ),
                 );
             } else {
                 r.add(Status::Ok, "hook-wait", "Stop hook with asyncRewake");
@@ -709,12 +734,13 @@ pub fn doctor(format: Format) -> Result<()> {
                 Status::Ok,
                 "config",
                 format!(
-                    "{}: machine {} of {}",
+                    "{}: machine {} of {}, idle {}",
                     Config::path()
                         .map(|p| p.display().to_string())
                         .unwrap_or_default(),
                     c.machine,
-                    c.machines.join(",")
+                    c.machines.join(","),
+                    crate::config::format_idle(c.idle()?)
                 ),
             );
             Some(c)

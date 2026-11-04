@@ -328,6 +328,120 @@ fn wait_exits_before_its_timeout() {
     );
 }
 
+/// A hook timeout far past the idle limits under test.
+const LONG_HOOK: &[(&str, &str)] = &[
+    ("BATON_HOOK_TIMEOUT_SECS", "60"),
+    ("BATON_HOOK_MARGIN_SECS", "1"),
+];
+
+/// Append `idle = "<idle>"` to the machine's config.
+fn set_config_idle(m: &Machine, idle: &str) {
+    let path = m.config_dir().join("config.toml");
+    let mut text = std::fs::read_to_string(&path).unwrap();
+    text.push_str(&format!("idle = {idle:?}\n"));
+    std::fs::write(path, text).unwrap();
+}
+
+#[test]
+fn wait_stops_after_the_idle_limit() {
+    let (_net, ws, laptop) = pair();
+    set_config_idle(&ws, "3s");
+    let out = as_session(&ws, &["on", "--lane", "main"], Some("host-1"), "s");
+    assert!(
+        out.ends_with("until `baton off` or 3s without a turn"),
+        "{out}"
+    );
+    // Long hook timeout: only the idle limit ends this waiter.
+    let start = Instant::now();
+    let w = spawn_waiter(&ws, "s", Some("host-1"), LONG_HOOK);
+    let run = finish(w, Duration::from_secs(20));
+    assert_eq!(run.code, 0, "{run:?}");
+    assert_eq!(run.stderr, "");
+    let took = start.elapsed();
+    assert!(
+        took >= Duration::from_millis(2500) && took < Duration::from_secs(8),
+        "{took:?}"
+    );
+
+    // Still listening: the next turn's `Stop` wakes for what arrived while
+    // the session sat idle.
+    let msg = laptop.post("ws", "while idle", &["--lane", "main"]);
+    let w = spawn_waiter(&ws, "s", Some("host-1"), LONG_HOOK);
+    let run = finish(w, Duration::from_secs(20));
+    assert_eq!(run.code, 2, "{run:?}");
+    assert_eq!(woken_ids(&run.stderr), vec![msg]);
+}
+
+#[test]
+fn on_idle_overrides_the_config_for_one_session() {
+    let (_net, ws, laptop) = pair();
+    set_config_idle(&ws, "2s");
+    let out = as_session(
+        &ws,
+        &["on", "--lane", "main", "--idle", "never"],
+        Some("host-1"),
+        "s",
+    );
+    assert!(out.ends_with("until `baton off`"), "{out}");
+    let json = as_session(&ws, &["--format", "json", "on"], Some("host-1"), "s");
+    let v: Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(v["items"][0]["idle"], "never", "{v}");
+
+    // Past the config's 2 s, the waiter still listens and wakes.
+    let mut w = spawn_waiter(&ws, "s", Some("host-1"), LONG_HOOK);
+    still_running(&mut w, Duration::from_secs(4));
+    let msg = laptop.post("ws", "late", &["--lane", "main"]);
+    let run = finish(w, Duration::from_secs(20));
+    assert_eq!(run.code, 2, "{run:?}");
+    assert_eq!(woken_ids(&run.stderr), vec![msg]);
+
+    // `off` and `on` keep the session's limit; `--idle default` drops it.
+    as_session(&ws, &["off"], Some("host-1"), "s");
+    let out = as_session(&ws, &["on"], Some("host-1"), "s");
+    assert!(out.ends_with("until `baton off`"), "{out}");
+    let out = as_session(&ws, &["on", "--idle", "90m"], Some("host-1"), "s");
+    assert!(out.ends_with("or 90m without a turn"), "{out}");
+    let out = as_session(&ws, &["on", "--idle", "default"], Some("host-1"), "s");
+    assert!(out.ends_with("or 2s without a turn"), "{out}");
+
+    // A bad limit is refused and changes nothing.
+    let out = hook_cmd(&ws, &["on", "--idle", "0"], Some("host-1"), Some("s"))
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let out = as_session(&ws, &["on"], Some("host-1"), "s");
+    assert!(out.ends_with("or 2s without a turn"), "{out}");
+}
+
+#[test]
+fn wait_takes_the_hook_timeout_from_its_flag() {
+    let (_net, ws, laptop) = pair();
+    let plan = laptop.post("ws", "plan", &["--task", "t", "--plan", "--lane", "main"]);
+    as_session(&ws, &["take", &plan], None, "s");
+    // `--timeout 4` beats the environment's 60: the waiter ends 1 s early.
+    let mut cmd = hook_cmd(&ws, &["hook", "wait", "--timeout", "4"], None, None);
+    cmd.env("BATON_HOOK_TIMEOUT_SECS", "60")
+        .env("BATON_HOOK_MARGIN_SECS", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(json!({"session_id": "s"}).to_string().as_bytes())
+        .unwrap();
+    let start = Instant::now();
+    let run = finish(child, Duration::from_secs(20));
+    assert_eq!(run.code, 0, "{run:?}");
+    let took = start.elapsed();
+    assert!(
+        took >= Duration::from_millis(2500) && took < Duration::from_secs(6),
+        "{took:?}"
+    );
+}
+
 #[test]
 fn wait_stops_when_the_task_is_closed() {
     let (_net, ws, laptop) = pair();

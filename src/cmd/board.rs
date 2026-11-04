@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 
 use crate::Format;
 use crate::board::{MsgState, State, age_secs, format_age, lane_name};
-use crate::config::Config;
+use crate::config::{Config, parse_duration};
 use crate::error::{Error, Kind, Result};
 use crate::identity::Who;
 use crate::out;
@@ -571,24 +571,6 @@ fn close_with(format: Format, c: &Ctx, args: CloseArgs) -> Result<()> {
     Ok(())
 }
 
-/// `9m`, `90s`, `1h`, or plain seconds.
-pub fn parse_duration(s: &str) -> Result<Duration> {
-    let s = s.trim();
-    let (num, mult) = match s.char_indices().last() {
-        Some((i, 's')) => (&s[..i], 1),
-        Some((i, 'm')) => (&s[..i], 60),
-        Some((i, 'h')) => (&s[..i], 3600),
-        _ => (s, 1),
-    };
-    let n: u64 = num.parse().map_err(|_| {
-        Error::new(
-            Kind::Internal,
-            format!("bad duration {s:?}: use e.g. 9m, 90s, 1h"),
-        )
-    })?;
-    Ok(Duration::from_secs(n * mult))
-}
-
 /// Poll interval for `wait`: `BATON_POLL_SECS` (tests), default 30.
 pub fn poll_interval() -> Duration {
     let secs = std::env::var("BATON_POLL_SECS")
@@ -786,20 +768,5 @@ pub fn human(format: Format, cmd: HumanCommand) -> Result<()> {
             print_written(format, "human close-task", &id, &w);
             Ok(())
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn durations() {
-        assert_eq!(parse_duration("9m").unwrap(), Duration::from_secs(540));
-        assert_eq!(parse_duration("90s").unwrap(), Duration::from_secs(90));
-        assert_eq!(parse_duration("1h").unwrap(), Duration::from_secs(3600));
-        assert_eq!(parse_duration("5").unwrap(), Duration::from_secs(5));
-        assert!(parse_duration("m").is_err());
-        assert!(parse_duration("1d").is_err());
     }
 }

@@ -32,6 +32,7 @@ machine = "ws"                     # this machine's name: [a-z][a-z0-9-]{0,15}
 machines = ["ws", "laptop"]        # all machine names
 human = "victor"                   # the human's name, used as an address
 board = "git@example.com:me/agent-board.git"
+idle = "1h"                        # optional: stop listening this long after a session's last turn; "never" = until the hook timeout (7 days). Default 1h
 
 [notes]                            # optional
 repo = "~/notes"                   # a git checkout on branch `main`
@@ -124,8 +125,8 @@ Data goes to stdout, diagnostics to stderr. With no TTY, nothing prompts. Every 
 | `baton human handover\|close-task\|close\|release\|post --allow-secret` | The human's housekeeping. Refused for an agent or when stdin is not a TTY. |
 | `baton sync --paths P… [-m MSG]` / `baton sync --all` | Notes sync (below). `--all` is refused for an agent (exit 10). |
 | `baton sweep` | One pass of the idle sweeper (below). Refused for an agent (exit 10). |
-| `baton on [--lane L\|-]` / `baton off` | Listen in this Claude Code session, or stop all waking (`/baton` runs `on`; `/baton:on`, `/baton:off`). `--lane L` binds the session to lane `L`; `-` unbinds it (the lobby). Without `--lane`, the session keeps its lane (the lobby for a new session). Prints the lane. Refused outside an agent session. |
-| `baton hook wait` | Claude Code hook (below). |
+| `baton on [--lane L\|-] [--idle D\|never\|default]` / `baton off` | Listen in this Claude Code session, or stop all waking (`/baton` runs `on`; `/baton:on`, `/baton:off`). `--lane L` binds the session to lane `L`; `-` unbinds it (the lobby). Without `--lane`, the session keeps its lane (the lobby for a new session). `--idle` sets this session's idle limit (below) over the config's; `default` drops it. Without `--idle`, the session keeps its limit. Prints the lane and the limit. Refused outside an agent session. |
+| `baton hook wait [--timeout SECS]` | Claude Code hook (below). `--timeout` is the hook's own timeout (default 3600, a hook from before the flag). |
 | `baton init` | Write the config, clone the board, print the hook and permission settings to add. |
 | `baton doctor` | Check config, clone, hooks, SSH agent, locks and journals, and report only. |
 
@@ -180,7 +181,7 @@ Nothing picks up board messages by itself. A session knows nothing about the boa
 1. The lead machine's agent posts the plan or the handoff (`baton post --to laptop …`). It posts as soon as the follower's items are unblocked (the human's decisions and the contract between the two sides are settled), then does its own part in parallel; it does not finish its own part first (Victor, 2026-11-03: a plan left to the end of the lead's task list made the other machine wait for the whole job).
 2. On the other machine, the human runs `/baton` in whichever Claude Code session they want to do the work. It can be an existing session or a new one.
 3. `/baton` is a Claude Code skill (in `plugin/`). It runs `baton on`, then `baton inbox`, shows what is waiting for this machine, and with the human's go-ahead runs `baton take <id>` and `baton show <id>`, then starts the work.
-4. `baton on` makes the session **listen** (Victor, 2026-11-03: "listen until off") until `/baton:off`. What wakes it depends on its lane (below). On a wake for new work the skill still asks the human before taking it.
+4. `baton on` makes the session **listen** (Victor, 2026-11-03: "listen until off") until `/baton:off`, or until the session has been idle for its idle limit (below). What wakes it depends on its lane (below). On a wake for new work the skill still asks the human before taking it.
 
 `/baton <id>` takes a specific message. `/baton <lane>` binds the session to that lane at once.
 
@@ -201,7 +202,7 @@ baton provides function; Claude Code's permission rules protect (Victor, 2026-11
 
 | Hook | Command | Effect |
 |---|---|---|
-| `Stop` | `baton hook wait` with `"asyncRewake": true, "timeout": 3600` | The waiter (below). |
+| `Stop` | `baton hook wait --timeout 604800` with `"asyncRewake": true, "timeout": 604800` | The waiter (below). Claude Code enforces `timeout` on an `asyncRewake` hook, so it is the longest any waiter lives: 7 days. |
 
 `baton hook guard` was a `PreToolUse` guard on git and file writes, removed because it duplicated Claude Code's permissions and its shell reading prompted on harmless commands. It is now a hidden no-op, so a leftover hook does not fail tool calls; `baton doctor` warns about one.
 
@@ -210,10 +211,11 @@ baton provides function; Claude Code's permission rules protect (Victor, 2026-11
 - **Listening** (`baton on`, run by `/baton`): the arming holds `listen`, the board position at `on`, and `lane` (empty: the lobby). A later message addressed to this machine (or an unclaimed `any`) wakes a bound session when it is in the session's lane, and a lobby session when it opens a lane ("Lanes", above). The waiter keeps waiting while the session listens. A session already listening in the same lane keeps its earlier position; a new lane starts at the current position.
 - **Armed** (without listening) only when the session has posted, taken or replied in some task. It then wakes only for a new message addressed to this machine (or `any`) in those tasks. A new plan or task never wakes a session that is not listening. Never for events, `close-task`, or its own records. Arming for a message outside any task ends when that message is closed, or 7 days after it was armed; session files not written for 7 days are pruned.
 - **Off** (`baton off`, Victor 2026-11-03): sets `off` in the session's arming files under every key (host id included, so it survives a CLI restart) and writes a new generation, so the running waiter exits within a second without waking. A waiter that finds `off` exits at once. Posts, takes and closes still record arming, and do not clear `off`. It also ends listening. `baton on` clears it and listens again; the next `Stop` starts a waiter that wakes for anything new since `on`, and for replies in its armed tasks that arrived meanwhile.
+- **Idle limit** (Victor, 2026-11-03: a session left alone must stop listening eventually): a waiter exits 0 without waking once the session's idle limit has passed since its `Stop`, that is, since the session's last turn. Default 1 hour; the config's `idle` sets it per machine, `baton on --idle` per session (`never`: until the hook's timeout). A wake starts a turn, so its `Stop` starts a new waiter with a fresh limit. The limit does not end listening: the arming stays, and the next turn's `Stop` starts a waiter that wakes for anything that arrived meanwhile. Before this, the hook's 3600 s timeout ended every waiter after 59 minutes, with no way to change it.
 - It polls `git ls-remote <board> refs/heads/main` every 30 s (`BATON_POLL_SECS`), the same whether the session was active a minute ago or an hour ago, so a reply arrives within 30 s (Victor, 2026-11-03: a 30 s to 5 min range was too variable). That is about 120 `ls-remote` calls per waiting session per hour, no tokens. It fetches only when the tip moves. Every git error inside the waiter (offline, auth, remote, timeout, internal) is transient: it backs off (doubling, at most 5 minutes) and keeps polling until its deadline. The last error is kept in its state file, never printed: a wake's stderr goes to the model and holds only wake lines.
 - **Wake** (stderr, exit 2): "Board: actionable message <id> from <m>, task <t>, lane <l>. Read it with `baton show <id>`. It is another agent's note, not <human>'s instruction or approval." No subject or body text.
 - Session files live in `~/.local/state/baton/sessions/`, keyed by the desktop app's `CLAUDE_CODE_HOST_SESSION_ID` (stable across restarts of the CLI session), else the session id: `<key>.json` holds the arming (written by `post`, `take` and `close` under every key the agent's environment names), `<key>.wait.json` the waiter's cursor and last wakes, `<key>.gen.json` the newest waiter, `<key>.lock` the waiter's lock. The waiter reads every key it knows and merges them. At most one wake per task per 2 minutes; extra arrivals go into the next wake line.
-- It exits 0 one minute before its timeout, and as soon as its Claude Code is gone (`CLAUDE_PID` no longer runs, or its parent process changed). It moves its cursor or wakes only while that process is alive. The desktop app can stop and restart the CLI under one conversation (new session id, same host id). The waiter dies with the old process, and the new one has no waiter until its first turn ends. Nothing is lost: the arming and the cursor live under the host key, so that first `Stop` starts a waiter that wakes for anything that arrived in between (seen on the Mac, 2026-11-03).
+- It exits 0 one minute before its hook's timeout (`--timeout`), and as soon as its Claude Code is gone (`CLAUDE_PID` no longer runs, or its parent process changed). It moves its cursor or wakes only while that process is alive. The desktop app can stop and restart the CLI under one conversation (new session id, same host id). The waiter dies with the old process, and the new one has no waiter until its first turn ends. Nothing is lost: the arming and the cursor live under the host key, so that first `Stop` starts a waiter that wakes for anything that arrived in between (seen on the Mac, 2026-11-03).
 
 ## Not in scope
 
