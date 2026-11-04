@@ -1,5 +1,5 @@
 [package]
-name = "baton"
+name = "baton-touch"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
@@ -10,6 +10,10 @@ homepage = "https://github.com/victorkwak/baton"
 readme = "README.md"
 keywords = ["agents", "claude-code", "git", "coordination", "cli"]
 categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "baton"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.104"

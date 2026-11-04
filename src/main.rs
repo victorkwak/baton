@@ -2,8 +2,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
-use baton::Format;
-use baton::cmd::{board, hooks, notes, setup};
+use baton_touch::Format;
+use baton_touch::cmd::{board, hooks, notes, setup};
 
 /// Coordinate AI coding agents on several machines through git.
 ///
@@ -12,7 +12,7 @@ use baton::cmd::{board, hooks, notes, setup};
 /// prints one object: `{"schema_version":1,"command":...,"items":[...]}`.
 /// Exit codes: see `docs/design.md`.
 #[derive(Debug, Parser)]
-#[command(version, about)]
+#[command(name = "baton", version, about)]
 struct Cli {
     /// Output format.
     #[arg(long, global = true, value_enum, default_value_t = Format::Text)]
