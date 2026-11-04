@@ -2,6 +2,12 @@
 
 All notable changes to `baton` (crate `baton-touch`). Versions follow [Semantic Versioning](https://semver.org/); before 1.0, a breaking change bumps the minor version.
 
+## [0.2.1] - 2026-11-03
+
+### Changed
+
+- Lane naming: one lane per workstream, one feature or problem each (e.g. `looks-share-sheet`), never a bare repo, platform or machine name (`zephie-looks`, `ios`, `mac`). The `/baton` skill now tells the lead to name lanes `<short repo>-<workstream>` and to reuse a lane only for the same workstream. Docs and README examples follow it. No code change.
+
 ## [0.2.0] - 2026-11-03
 
 ### Added
@@ -42,5 +48,6 @@ First release, tried on two machines.
 
 - The `PreToolUse` guard. `baton hook guard` is a no-op, so a leftover hook does not fail tool calls; `baton doctor` warns about one. `baton init` prints a deny rule for edits in the board clone instead.
 
+[0.2.1]: https://github.com/victorkwak/baton/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/victorkwak/baton/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/victorkwak/baton/releases/tag/v0.1.0

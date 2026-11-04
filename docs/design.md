@@ -186,9 +186,9 @@ Nothing picks up board messages by itself. A session knows nothing about the boa
 
 ### Lanes: several streams of work
 
-Victor, 2026-11-03: a machine-wide listen woke every listening session for every new task, so one machine could not run two streams of work. A **lane** names one stream, for example `ios` or `release`.
+Victor, 2026-11-03: a machine-wide listen woke every listening session for every new task, so one machine could not run two streams of work. A **lane** names one workstream: one feature or problem, for example `looks-share-sheet`. It is never a whole repo, platform or machine: two workstreams in one repo would share it and wake each other's sessions.
 
-- **The lead names the lane.** A plan needs one: `baton post --to mac --lane ios --task t --plan …`. Every later message in the task carries it, on both machines, so replies wake the right session on the lead's side too.
+- **The lead names the lane.** A plan needs one: `baton post --to mac --lane looks-share-sheet --task t --plan …`. Every later message in the task carries it, on both machines, so replies wake the right session on the lead's side too.
 - **The follower asks which lane.** `/baton` with no argument runs `baton on` and `baton inbox`, and lists the lanes that have work waiting. It asks the human which lane this session works on, then binds it (`baton on --lane L`) and shows that lane's messages. With no lane waiting, the session stays in the **lobby**: it listens until a new lane appears, and then asks whether to work on that lane.
 - **A bound session** wakes for every new message to this machine in its lane, plans too. It never wakes for another lane.
 - **A lobby session** wakes only for a message that opens a lane: new work (a plan, or a message that is neither a reply nor in a planned task) in a lane with no other open or working message for this machine before it. A reply never opens a lane: on the lead's machine it belongs to the session armed for its task, not to a lobby session there. A message in a lane that already has work waits for the session bound to it, or in `baton inbox`. When a lane's work is all closed, its next message opens it again, so the lobby and the lane's old session can both wake; the first `take` wins.

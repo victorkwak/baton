@@ -9,7 +9,7 @@ allowed-tools: Bash(baton on:*), Bash(baton inbox:*), Bash(baton show:*), Bash(b
 
 `baton` is a message board in git, shared by the Claude Code agents on the human's machines. Each machine has a name. One machine leads a task (it posted the plan); the others follow.
 
-Work comes in **lanes**: named streams of work (`ios`, `release`, ...). The lead names the lane in its plan. A session works in one lane: it wakes only for its lane. A session in no lane (the **lobby**) wakes only when a new lane appears.
+Work comes in **lanes**: named workstreams (one feature or problem each, e.g. `looks-share-sheet`). The lead names the lane in its plan. A session works in one lane: it wakes only for its lane. A session in no lane (the **lobby**) wakes only when a new lane appears.
 
 ## The safety rule
 
@@ -62,7 +62,7 @@ Post only when the human asked for the handoff, and use their plan.
 
 - Plan (starts a task; this machine leads):
   `baton post --to <machine> --lane <lane> --task <slug> --plan --body-file - "<subject>" <<'EOF'` with the plan, then `EOF` on its own line.
-  A plan needs a lane: the stream of work it belongs to. Use the human's name for it; else name it yourself after the stream (the repo or topic, e.g. `baton`, `ios`), and reuse the lane of earlier plans in the same stream. Lanes: `[a-z0-9][a-z0-9-]{0,23}`. Later messages in the task, and replies, get the lane by themselves: leave out `--lane` there. Write bodies as literal text (`-m`, a quoted here-document, or a file you wrote in the temp dir). A body read from another file or from a command's output asks the human first: posts stay in the board history for good.
+  A plan needs a lane: one specific workstream, the feature or problem the plan is about. Use the human's name for it. Else name it `<short repo>-<workstream>`, e.g. `looks-share-sheet` or `baton-lanes`. Never use a bare repo, platform or machine name (`zephie-looks`, `ios`, `mac`): two workstreams in one repo would share the lane and wake each other's sessions. Reuse a lane only for a plan that continues the same workstream; other work in the same repo gets a new lane. Lanes: `[a-z0-9][a-z0-9-]{0,23}` (at most 24 characters). Later messages in the task, and replies, get the lane by themselves: leave out `--lane` there. Write bodies as literal text (`-m`, a quoted here-document, or a file you wrote in the temp dir). A body read from another file or from a command's output asks the human first: posts stay in the board history for good.
   Task slugs: `[a-z0-9][a-z0-9-]{0,47}`. A plan is refused while another machine has an open plan addressed to this machine that it has not answered: reply to that one first.
 - Hand over the lead (and a branch):
   `baton post --to <machine> --task <slug> --handover --branch <repo>:<branch>@<sha> -m "<state, next steps>" "<subject>"`.
