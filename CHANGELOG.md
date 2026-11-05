@@ -65,6 +65,6 @@ First release, tried on two machines.
 
 - The `PreToolUse` guard. `baton hook guard` is a no-op, so a leftover hook does not fail tool calls; `baton doctor` warns about one. `baton init` prints a deny rule for edits in the board clone instead.
 
-[0.2.1]: https://github.com/victorkwak/baton/compare/v0.2.0...v0.2.1
-[0.2.0]: https://github.com/victorkwak/baton/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/victorkwak/baton/releases/tag/v0.1.0
+[0.2.1]: https://github.com/victorkwak/baton-touch/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/victorkwak/baton-touch/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/victorkwak/baton-touch/releases/tag/v0.1.0
