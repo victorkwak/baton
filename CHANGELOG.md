@@ -23,7 +23,7 @@ All notable changes to `baton` (crate `baton-touch`). Versions follow [Semantic 
 
 ### Changed
 
-- Lane naming: one lane per workstream, one feature or problem each (e.g. `looks-share-sheet`), never a bare repo, platform or machine name (`zephie-looks`, `ios`, `mac`). The `/baton` skill now tells the lead to name lanes `<short repo>-<workstream>` and to reuse a lane only for the same workstream. Docs and README examples follow it. No code change.
+- Lane naming: one lane per workstream, one feature or problem each (e.g. `looks-share-sheet`), never a bare repo, platform or machine name (`myapp-looks`, `ios`, `mac`). The `/baton` skill now tells the lead to name lanes `<short repo>-<workstream>` and to reuse a lane only for the same workstream. Docs and README examples follow it. No code change.
 
 ## [0.2.0] - 2026-11-03
 
