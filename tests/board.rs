@@ -192,7 +192,17 @@ fn two_machines_racing_thirty_posts_each_lose_nothing() {
         let to = if m.name == "ws" { "laptop" } else { "ws" };
         (0..30)
             .map(|i| {
-                let r = m.run(&["post", "--to", to, "-m", "x", &format!("post {i}")]);
+                let subject = format!("post {i}");
+                let mut r = m.run(&["post", "--to", to, "-m", "x", &subject]);
+                // Under load a post can lose every push race. It then writes
+                // nothing and asks the caller to try again, so do that. The
+                // checks below prove that such an attempt left no record.
+                for _ in 0..5 {
+                    if r.code != 32 || !r.stderr.contains("lost the race") {
+                        break;
+                    }
+                    r = m.run(&["post", "--to", to, "-m", "x", &subject]);
+                }
                 assert_eq!(r.code, 0, "{} post {i}: {r:?}", m.name);
                 r.stdout.trim().to_owned()
             })

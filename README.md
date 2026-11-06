@@ -26,10 +26,10 @@ You need Rust 1.89 or later, git, and Claude Code on every machine.
 
    Then do the next steps on each machine.
 
-2. **Install the CLI.** The crate is not on crates.io yet (`baton` on crates.io is a different crate). Install from git:
+2. **Install the CLI.** The crate is `baton-touch` (`baton` on crates.io is a different crate). It installs a binary named `baton`:
 
    ```sh
-   cargo install --git https://github.com/victorkwak/baton-touch --locked
+   cargo install baton-touch --locked
    ```
 
    Or from a clone:
